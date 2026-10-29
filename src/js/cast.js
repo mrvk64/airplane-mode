@@ -1,0 +1,123 @@
+// Airplane Mode: the cast. Every account in the fictional world of Harbor City lives here.
+// voice    = how the account sounds when it replies to the player (reply pools are keyed by voice)
+// suspect  = one of the four people who might secretly run @overheard_hc. Suspect text is styled by
+//            the engine (lowercase or not, signature emoji), so the clues stay consistent everywhere.
+window.AM = window.AM || {};
+
+AM.VOICES = ['hype', 'snark', 'wholesome', 'contrarian', 'pun', 'chaos', 'brand', 'expert', 'artsy', 'bot', 'news'];
+
+AM.CAST = [
+  // ---- the main story -------------------------------------------------------------------------
+  { id: 'jade', name: 'Jade Moreno', handle: 'jadeinthecity', emoji: '🌸', hue: 330, followers: 312000, verified: true,
+    voice: 'hype', role: 'story',
+    bio: 'lifestyle • harbor city • living out loud 🤍 PR: jade@moreno.studio',
+    style: 'Warm, dramatic lifestyle influencer. Says "you guys", "obsessed", "I can\'t". Uses 🤍 a lot. Proper case. Dating Luca.' },
+  { id: 'luca', name: 'Luca Ferri', handle: 'lucaferri', emoji: '🍝', hue: 15, followers: 48200, verified: true,
+    voice: 'wholesome', role: 'story',
+    bio: 'Chef + owner, Ferri\'s Trattoria (Old Town). Pasta is a love language.',
+    style: 'Passionate chef. Drops Italian words (allora, mamma mia, basta). Goes ALL CAPS about food crimes. Dating Jade.' },
+  { id: 'priya', name: 'Priya Raman', handle: 'priyaeats', emoji: '🥢', hue: 280, followers: 89400, verified: true,
+    voice: 'snark', role: 'story',
+    suspect: { lower: true, emoji: '💅', phrase: 'respectfully' },
+    bio: 'food critic. i eat so you don\'t have to. opinions are mine and correct',
+    style: 'Food critic. All lowercase. Ends posts with 💅. Says "respectfully" before an insult.' },
+  { id: 'dev', name: 'Dev Okafor', handle: 'devonthedecks', emoji: '🎧', hue: 250, followers: 61300, verified: false,
+    voice: 'chaos', role: 'story',
+    suspect: { lower: true, emoji: '🌙', phrase: 'no notes' },
+    bio: 'dj. residency @ lumen rooftop fridays. i see everything from the booth',
+    style: 'Nightlife DJ. All lowercase. Ends posts with 🌙. Says "no notes" when something is perfect.' },
+  { id: 'margot', name: 'Margot Lindqvist', handle: 'margot.makes', emoji: '🪴', hue: 160, followers: 140500, verified: true,
+    voice: 'artsy', role: 'story',
+    suspect: { lower: false, emoji: '💅', phrase: 'Just saying.' },
+    bio: 'Interior designer. Founder, Lindqvist Home. Beige is a personality.',
+    style: 'Polished interior designer, a little passive-aggressive. Proper case. Ends posts with 💅. Says "Just saying."' },
+  { id: 'theo', name: 'Theo Park', handle: 'theoparkfit', emoji: '💪', hue: 200, followers: 77100, verified: false,
+    voice: 'hype', role: 'story',
+    suspect: { lower: false, emoji: '🌙', phrase: 'Let\'s be real.' },
+    bio: 'Coach. 5am club. Your only competition is yesterday you.',
+    style: 'Motivational fitness coach, Jade\'s ex. Proper case. Ends posts with 🌙. Says "Let\'s be real."' },
+  { id: 'overheard', name: 'Overheard HC', handle: 'overheard_hc', emoji: '🤫', hue: 0, followers: 0, verified: false,
+    voice: 'snark', role: 'story',
+    bio: 'harbor city has secrets. i have receipts. dms open.',
+    style: 'Anonymous gossip account. Written by the engine in the secret owner\'s style.' },
+
+  // ---- side stories ---------------------------------------------------------------------------
+  { id: 'greg', name: 'Greg Dunleavy', handle: 'gregbuildsthings', emoji: '🧱', hue: 25, followers: 3100, verified: false,
+    voice: 'pun', role: 'side',
+    bio: 'Dad of 3. Amateur builder. Professional optimist. Wife says I need a permit.',
+    style: 'Cheerful suburban dad, DIY disasters, terrible puns, never discouraged.' },
+  { id: 'carl', name: 'Carl Mensah', handle: 'courtsidecarl', emoji: '🏀', hue: 35, followers: 22400, verified: true,
+    voice: 'expert', role: 'side',
+    bio: 'Herons beat reporter. Courtside since 2011. Stats don\'t lie (players do).',
+    style: 'Basketball reporter. Live-posts games. Stats, hype, "BANG!".' },
+  { id: 'june', name: 'June Albright', handle: 'nanajune', emoji: '🐶', hue: 50, followers: 1800, verified: false,
+    voice: 'wholesome', role: 'side',
+    bio: 'Retired 3rd grade teacher. Grandma of 6. Biscuit\'s mom. Learning the hashtags!',
+    style: 'Sweet grandma who is new to social media. Signs posts "Love, June". Occasionally types a hashtag wrong.' },
+
+  // ---- the rest of the feed -------------------------------------------------------------------
+  { id: 'kai', name: 'Kai Nakamura', handle: 'kaikaikai', emoji: '🛹', hue: 300, followers: 15200, verified: false,
+    voice: 'chaos', role: 'feed',
+    bio: 'certified menace. 22. professional yapper',
+    style: 'Gen-Z chaos. Lowercase, "lmao", "bestie", "not me", "it\'s giving". Unhinged but kind.' },
+  { id: 'harry', name: 'Harry Voss', handle: 'hottakeharry', emoji: '🌶️', hue: 5, followers: 9100, verified: false,
+    voice: 'contrarian', role: 'feed',
+    bio: 'Unpopular opinions, delivered fresh daily. Ratio me, I dare you.',
+    style: 'Contrarian. Hot takes about everything (pizza toppings, sports, brunch). Starts with "Hot take:" or "Unpopular opinion:".' },
+  { id: 'transit', name: 'Harbor City Transit', handle: 'hctransit', emoji: '🚋', hue: 210, followers: 54000, verified: true,
+    voice: 'brand', role: 'feed',
+    bio: 'Official account of the Harbor Line tram + bus network. Mind the gap (and the vibes).',
+    style: 'Sassy brand account run by an intern who is too online. Service updates mixed with jokes.' },
+  { id: 'lena', name: 'Lena Okoye', handle: 'lenacodes', emoji: '💻', hue: 190, followers: 12300, verified: false,
+    voice: 'expert', role: 'feed',
+    bio: 'senior engineer. professional "it works on my machine" sayer.',
+    style: 'Dry software engineer humor, deploys on Friday, coffee dependent.' },
+  { id: 'rosa', name: 'Rosa Delgado', handle: 'rosaruns', emoji: '👟', hue: 140, followers: 6200, verified: false,
+    voice: 'hype', role: 'feed',
+    bio: 'marathoner x7 • run club captain • you can do hard things!!',
+    style: 'Relentlessly positive runner. Exclamation points. Cheers everyone on.' },
+  { id: 'sam', name: 'Sam Whitaker', handle: 'samwhitakerphoto', emoji: '📷', hue: 220, followers: 33100, verified: false,
+    voice: 'artsy', role: 'feed',
+    bio: 'Photographer. Chasing light around Harbor City.',
+    style: 'Thoughtful photographer. Short poetic captions about light, weather and the city.' },
+  { id: 'marcus', name: 'Marcus Bell', handle: 'marcusplays', emoji: '🎮', hue: 270, followers: 41000, verified: false,
+    voice: 'chaos', role: 'feed',
+    bio: 'streamer. 3x regional finalist (we don\'t talk about the finals)',
+    style: 'Gamer/streamer. Gaming slang ("gg", "skill issue", "nerf this"). Loud.' },
+  { id: 'ava', name: 'Ava Chen', handle: 'avasays', emoji: '👗', hue: 340, followers: 7400, verified: false,
+    voice: 'hype', role: 'feed',
+    bio: 'fashion student • thrift queen • compliments are free',
+    style: 'Fashion student, hypes everyone\'s outfits, "the fit!!", "slay".' },
+  { id: 'moe', name: 'Moe\'s Deli', handle: 'moesdeli', emoji: '🥪', hue: 45, followers: 11000, verified: false,
+    voice: 'brand', role: 'feed',
+    bio: 'Old Town since 1987. Sandwiches. No substitutions. No exceptions. No mayo on the pastrami.',
+    style: 'Grumpy, aggressive deli account. ALL CAPS sometimes. Feuds with people who put mayo on things.' },
+  { id: 'wren', name: 'Wren Holloway', handle: 'wrenwrites', emoji: '🐈', hue: 230, followers: 4300, verified: false,
+    voice: 'wholesome', role: 'feed',
+    bio: 'poems, tea, one (1) cat named Pickle',
+    style: 'Soft, melancholy poet. Short lines. Rain, tea and Pickle the cat.' },
+  { id: 'weather', name: 'HC Weather Bot', handle: 'hcweatherbot', emoji: '⛅', hue: 200, followers: 26000, verified: false,
+    voice: 'bot', role: 'feed',
+    bio: 'Automated Harbor City weather. Beep boop. Not responsible for your umbrella decisions.',
+    style: 'Weather bot that is slightly too self-aware. Formatted like an automated report.' },
+  { id: 'ollie', name: 'Ollie Grant', handle: 'olliegrant', emoji: '📈', hue: 120, followers: 18200, verified: false,
+    voice: 'contrarian', role: 'feed',
+    bio: 'Founder. Investor. Thought leader. Here\'s what my divorce taught me about B2B sales.',
+    style: 'Parody "thought leader". Turns everything into a business lesson. "Agree?"' },
+  { id: 'nina', name: 'Nina Petrova', handle: 'ninaflies', emoji: '🛫', hue: 185, followers: 25300, verified: false,
+    voice: 'wholesome', role: 'feed',
+    bio: 'Flight attendant, 9 yrs. Yes I saw what you did with the tray table.',
+    style: 'Funny flight attendant. Cabin crew secrets, passenger stories, travel tips.' },
+  { id: 'hcnow', name: 'Harbor City Now', handle: 'hcnow', emoji: '📰', hue: 355, followers: 210000, verified: true,
+    voice: 'news', role: 'feed',
+    bio: 'Local news, fast. Tips: tips@hcnow.news',
+    style: 'Local news account. "BREAKING:" and "JUST IN:" headlines about fictional city events.' }
+];
+
+AM.byId = {};
+AM.CAST.forEach(c => { AM.byId[c.id] = c; });
+AM.SUSPECTS = AM.CAST.filter(c => c.suspect).map(c => c.id);
+
+// Places the writers may mention, so the city feels like one place.
+AM.PLACES = ['Lumen rooftop bar', 'Ferri\'s Trattoria (Old Town)', 'Pier 9', 'Old Town', 'the Harbor Line tram',
+  'Moe\'s Deli', 'Kestrel Park', 'the Herons arena', 'Harbor City Airport', 'the night market on Canal St'];
