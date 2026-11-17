@@ -8,7 +8,7 @@ const vm = require('vm');
 
 const root = path.join(__dirname, '..');
 const src = p => fs.readFileSync(path.join(root, 'src', p), 'utf8');
-const JS_ALL = ['js/cast.js', 'js/content-feed.js', 'js/content-replies.js', 'js/content-tone.js', 'js/story.js', 'js/kids-story.js', 'js/kids-content.js', 'js/content-learn.js', 'js/art.js', 'js/faces.js', 'js/app.js'];
+const JS_ALL = ['js/cast.js', 'js/content-feed.js', 'js/content-replies.js', 'js/content-tone.js', 'js/content-react.js', 'js/story.js', 'js/kids-story.js', 'js/kids-content.js', 'js/content-learn.js', 'js/art.js', 'js/faces.js', 'js/app.js'];
 // Content files written in parallel may not exist yet; bundle whatever is there.
 const JS = JS_ALL.filter(f => fs.existsSync(path.join(root, 'src', f)));
 const missing = JS_ALL.filter(f => !JS.includes(f));

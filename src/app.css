@@ -580,3 +580,5 @@ svg { display: block; }
 .seat-tag svg { width: 15px; height: 15px; }
 .learn-link { margin-top: 8px; }
 .learn-link svg { width: 15px; height: 15px; }
+.bubble.sys { align-self: center; background: none; color: var(--muted); font-size: 13px; padding: 4px 8px; }
+.blocked-note { margin: 0; color: var(--muted); font-size: 14px; }

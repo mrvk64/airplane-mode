@@ -12,7 +12,7 @@
 //           the network.
 'use strict';
 
-const VERSION = 'bc4959723b927';
+const VERSION = 'bf5ffe036b382';
 const PREFIX = 'airplanemode-';
 const APP_CACHE = PREFIX + VERSION;
 const FONT_CACHE = PREFIX + 'fonts';

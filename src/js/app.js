@@ -290,7 +290,7 @@
     const others = shuffle(SUSPECTS.filter(x => x !== culprit), r);
     const start = Date.now(), duration = b.dur * MIN;
     S = {
-      v: 1, skew: 0, world: W.kind, rel: {}, argue: {}, learned: {}, quiz: {}, lastRivalT: 0,
+      v: 1, skew: 0, world: W.kind, rel: {}, argue: {}, learned: {}, quiz: {}, blocked: {}, insults: {}, apologized: {}, lastRivalT: 0,
       player: { name: b.name, handle: b.handle, emoji: b.emoji, hue: b.hue, from: b.from, to: b.to, seat: b.seat, tier: b.tier,
         interests: b.interests, startFollowers: b.carry != null ? b.carry : TIERS[b.tier].followers },
       flight: { start, duration, minutes: b.dur, seed, culprit, decoy1: others[0], decoy2: others[1], winner: pick(ST.game.teams, r),
@@ -418,8 +418,9 @@
   function dmReply(who, text) {
     const low = text.toLowerCase(), c = C[who], v = c.voice;
     const aboutOH = TOPICS[0][1].test(low) || /secret|leak|\btea\b|clue/.test(low);
-    const tone = detectTone(text);
-    if (tone && who !== 'overheard') bump(who, { insult: -2, rage: -1, snark: -1, nice: 1.5 }[tone]);
+    const tone = T ? detectTone(text, true) : null;
+    if (T && AM.REACT && tone === 'insult' && who !== 'overheard') return Object.assign(reactToInsult(who, hostility(text, true)), { styled: true });
+    if (tone && who !== 'overheard') bump(who, { rage: -1, snark: -1, nice: 1.5 }[tone]);
     let pool;
     if (who === 'overheard') pool = S.revealT ? (ST.overheardRetired || ST.overheardDm) : ST.overheardDm;
     else if (c.suspect && !S.revealT && (aboutOH || /\bis it you\b|\bare you\b|\bit'?s you\b/.test(low))) pool = ST.suspectDm[who];
@@ -429,11 +430,14 @@
     else if (aboutOH && !S.revealT && R.dmOverheard.length) pool = R.dmOverheard;
     else if (/^\s*(hi+|hey+|hello|yo|sup|hiya|howdy|gm|good (morning|evening|afternoon))\b/.test(low) && (R.dmHello[v] || []).length) pool = R.dmHello[v];
     else pool = (R.dm[v] || []).length ? R.dm[v] : ['haha wait tell me more', 'ok but are you on a plane right now'];
-    return pickFresh(pool, 'dm' + who);
+    return { text: pickFresh(pool, 'dm' + who) };
   }
   function sendDm(who, text) {
+    if (isBlocked(who)) return;
     pushMsg(who, { from: 'me', text, t: now() });
-    schedule({ t: now() + rand(2600, 6200), kind: 'dm', who, text: dmReply(who, text) });
+    const r = dmReply(who, text), at = now() + rand(2600, 6200);
+    schedule({ t: at, kind: 'dm', who, text: r.text, styled: !!r.styled });
+    if (r.block) schedule({ t: at + 900, kind: 'block', who });
     refreshOpen(); saveSoon();
   }
   function pickFresh(arr, ns) {
@@ -479,6 +483,19 @@
           addNotif({ t: e.t + 2, type: 'follow', by: [e.by], html: `<b>${esc(C[e.by].name)}</b> followed you`, go: { profile: e.by } });
         }
       }
+    } else if (e.kind === 'block') {
+      S.blocked[e.who] = true;
+      if (S.dms[e.who] && S.dms[e.who].msgs.length) pushMsg(e.who, { from: 'sys', text: C[e.who].name + ' blocked you.', t: e.t });
+      addNotif({ t: e.t, type: 'beef', by: [e.who], html: '<b>' + esc(C[e.who].name) + '</b> blocked you', go: { profile: e.who } });
+      if (fresh && !chatOpen(e.who)) toast({ who: e.who, title: C[e.who].name + ' blocked you', text: 'You can send an apology from their profile.', go: { profile: e.who } });
+    } else if (e.kind === 'apology') {
+      const kind = AM.REACT.style[C[e.who].voice] || 'hurt';
+      const odds = { hurt: 0.75, deflect: 0.7, formal: 0.5, pr: 0.85, bot: 0.6, clap: 0.4 }[kind] - ((S.insults[e.who] || 0) > 4 ? 0.2 : 0);
+      if (Math.random() < odds) {
+        S.blocked[e.who] = false; S.insults[e.who] = 0; bump(e.who, 4);
+        pushMsg(e.who, { from: 'them', text: style(e.who, pick(AM.REACT.apologyYes)), t: e.t });
+        addNotif({ t: e.t, type: 'follow', by: [e.who], html: '<b>' + esc(C[e.who].name) + '</b> accepted your apology and unblocked you', go: { chat: e.who } });
+      } else addNotif({ t: e.t, type: 'beef', by: [e.who], html: '<b>' + esc(C[e.who].name) + '</b> saw your apology', quote: style(e.who, pick(AM.REACT.apologyNo)), go: { profile: e.who } });
     } else if (e.kind === 'likeReply') {
       const p = postIndex.get(e.post), r = p && p.replies.find(x => x.id === e.rid);
       if (!r) return;
@@ -492,7 +509,7 @@
       addNotif({ t: e.t, type: 'repost', by: [e.by], html: `<b>${esc(C[e.by].name)}</b> quoted your post`, quote: text, go: { post: id } });
     } else if (e.kind === 'dm') {
       const isShot = e.text === '[screenshot]';
-      const text = isShot ? '' : style(e.who, fill(e.text));
+      const text = isShot ? '' : e.styled ? e.text : style(e.who, fill(e.text));
       pushMsg(e.who, { from: 'them', text, t: e.t, kind: isShot ? 'shot' : null });
       if (fresh && !chatOpen(e.who)) {
         toast({ who: e.who, title: C[e.who].name, text: isShot ? 'Sent a screenshot' : text, go: { chat: e.who } });
@@ -598,16 +615,34 @@
   }
 
   // ---------- tone, quoting back, and memory ----------
+  // Insults are scored rather than matched by one pattern: hard insults count on their own, soft words
+  // ("hate", "boring", "sucks") only when aimed at someone, and swearing or a brush-off always counts.
+  const HARD_INSULT = /\b(stupid|dumb(est)?|idiot(ic|s)?|moron|fool|clown|loser|trash|garbage|pathetic|ugly|disgusting|weirdo|freak|creep|jerk|fraud|bozo|dork|dweeb|worthless|irrelevant|delusional|clueless|npc|try-?hard|embarrassing|gross)\b/;
+  const SOFT_INSULT = /\b(hate|worst|terrible|awful|boring|annoying|irritating|sucks?|stinks?|mid|lame|cringe|useless|fake|nasty|flop|joke)\b/;
+  const SWEAR = /\b(f+u+c+k\w*|fk|f off|wtf|shit\w*|bitch\w*|ass(hole)?s?|bastard|dick|piss off|stfu|gtfo)\b/;
+  const DISMISS = /(shut up|go away|get lost|nobody asked|who asked|didn'?t ask|nobody cares|who cares|cry about it|go cry|touch grass|delete (your|ur) account|log off|stop posting|be quiet|get a life|do better|(nobody|no one) likes you|you'?re a joke|what a joke|blocked lol|l \+ ratio|\b(terrible|awful|bad|worst|dumb|stupid) take|\bkys\b|kill (yourself|urself))/;
+  const AT_YOU = /\b(you|u|ur|your|yours|you'?re|youre|ya)\b|@\w/;
+  // `directed` is true for replies and DMs (already aimed at someone); posts need a "you" or an @mention.
+  function hostility(text, directed) {
+    const low = text.toLowerCase(), aimed = directed || AT_YOU.test(low);
+    const sw = low.match(SWEAR), hard = low.match(HARD_INSULT), soft = low.match(SOFT_INSULT), d = low.match(DISMISS);
+    // a soft word in a reply counts when it is the whole reply ("cringe") or names a person ("worst person here")
+    const softAimed = soft && (AT_YOU.test(low) || (directed && (low.trim().split(/\s+/).length <= 2 || /\b(person|account|post|take|human|guy|dude|bro)\b/.test(low))));
+    let score = (sw ? 3 : 0) + (d ? 3 : 0) + (hard ? 2 : 0) + (softAimed ? 2 : 0);
+    if (!aimed && !d && !sw) score = 0;
+    const word = d ? d[0].trim() : hard ? hard[1] : softAimed ? soft[1] : null;
+    return { insult: score >= 2, harsh: !!sw || /\bkys\b|kill (yourself|urself)/.test(low) || score >= 6, word };
+  }
   const TONE_RX = {
-    insult: /\b(stupid|dumb|idiot|trash|garbage|clown|loser|cringe|pathetic|shut up|stfu|nobody asked|who asked|lame|worst take|get a life)\b/,
-    snark: /(sure,? jan|ok boomer|\bimagine\b|\bcope\b|seethe|\bmid\b|bro thinks|nobody cares|cool story|yeah right|groundbreaking|riveting|thanks for the update|\bas if\b|\/s\b|🙄|💀|\blol ok\b|\bok and\b|^k\.?$|wow,? (great|amazing|incredible)|big if true|nice try|sure buddy|ok buddy|real original)/,
+    snark: /(thanks for nothing|wow,? (you'?re|ur|youre) so (smart|funny|original|cool|deep)|sure,? jan|ok boomer|\bimagine\b|\bcope\b|seethe|\bmid\b|bro thinks|nobody cares|cool story|yeah right|groundbreaking|riveting|thanks for the update|\bas if\b|\/s\b|🙄|💀|\blol ok\b|\bok and\b|^k\.?$|wow,? (great|amazing|incredible)|big if true|nice try|sure buddy|ok buddy|real original)/,
     rage: /(objectively|worst .{0,24}ever|overrated|fight me|change my mind|hot take|unpopular opinion|is a scam|should be illegal|nobody likes|everyone who|if you .{0,30} you('re| are)|i said what i said|ratio|\bfraud)/,
     nice: /(love (this|you|it|that|your)|so cute|amazing|proud of you|you'?re the best|thank you|\bthanks\b|great job|beautiful|wholesome|congrats|❤|🥰|😊|💕|you rock|so kind|appreciate|well done|you got this|truce|sorry|my bad|apolog|you'?re (great|awesome|right|funny)|fair point|good point|no hard feelings)/
   };
-  function detectTone(text) {
+  function detectTone(text, directed) {
     const low = text.toLowerCase(), letters = text.replace(/[^a-zA-Z]/g, '');
     const caps = letters.length > 12 && letters.replace(/[^A-Z]/g, '').length / letters.length > 0.6;
-    if (TONE_RX.insult.test(low)) return 'insult';
+    if (/thanks for nothing|so (smart|funny|original|cool|deep)\b/.test(low) && !hostility(text, directed).insult) return 'snark';
+    if (hostility(text, directed).insult) return 'insult';
     if (caps || TONE_RX.rage.test(low)) return 'rage';
     if (TONE_RX.snark.test(low)) return 'snark';
     if (TONE_RX.nice.test(low)) return 'nice';
@@ -629,6 +664,32 @@
     S.rel[id] = clamp((S.rel[id] || 0) + d, -10, 10);
   }
   const relOf = id => (S.rel && S.rel[id]) || 0;
+  const isBlocked = id => !!(S.blocked && S.blocked[id]);
+  // What a character says back to an insult. Fighters clap back (often quoting you), gentle people get
+  // hurt, brands go into PR mode, and once you pass their patience they block you.
+  function reactToInsult(id, h) {
+    const X = AM.REACT, c = C[id], kind = X.style[c.voice] || 'hurt';
+    S.insults[id] = (S.insults[id] || 0) + (h.harsh ? 2 : 1);
+    bump(id, h.harsh ? -5 : -3);
+    const say = line => style(id, scrub(fill(String(line).replace(/\{insult\}/g, h.word || '').replace(/\{seat\}/g, S.player.seat))));
+    if (S.insults[id] >= X.patience[kind]) { S.blocked[id] = true; S.argue[id] = 0; return { text: say(pick(X.block[kind])), block: true }; }
+    if (h.harsh && Math.random() < 0.6) return { text: say(pick(X.harsh)) };
+    if (kind === 'clap') {
+      if (h.word && Math.random() < 0.55) return { text: say(pickFresh(X.clapEcho, 'ce')) };
+      return { text: say(pickTagged(T.escalate[Math.min(2, S.insults[id] - 1)], id) || 'Bold of you.') };
+    }
+    if (kind === 'hurt') return { text: say(h.word && Math.random() < 0.35 ? pickFresh(X.hurtEcho, 'he') : pickTagged(X.hurt, id) || 'Okay. That hurt.') };
+    if (kind === 'bot') return { text: say(pickFresh(X.bot, 'bo')) };
+    return { text: say(pickTagged(X[kind], id) || 'Noted.') };
+  }
+  // Someone nearby sticks up for the person you insulted in public.
+  function defenderFor(victim, used) {
+    const pool = CAST.filter(c => c.id !== victim && !NO_REPLY.has(c.id) && !isBlocked(c.id) && !(used && used.has(c.id)) && ['wholesome', 'hype', 'artsy', 'pun'].includes(c.voice));
+    if (!pool.length) return null;
+    const by = pick(pool).id;
+    bump(by, -1);
+    return { by, text: style(by, scrub(fill(pickFresh(AM.REACT.defend, 'df').replace(/\{victim\}/g, first(C[victim].name))))) };
+  }
   // A line from a [tag, text] pool that this character could say: their own lines, then their voice.
   function pickTagged(pool, id) {
     if (!pool || !pool.length || !C[id]) return null;
@@ -643,8 +704,8 @@
   }
   const poolFor = tp => (tp === 'generic' ? R.generic : R.topics[tp]) || [];
   function authorsFor(tag, used) {
-    if (C[tag]) return !used.has(tag) && !NO_REPLY.has(tag) ? [tag] : [];
-    return CAST.filter(c => c.voice === tag && !used.has(c.id) && !NO_REPLY.has(c.id)).map(c => c.id);
+    if (C[tag]) return !used.has(tag) && !NO_REPLY.has(tag) && !isBlocked(tag) ? [tag] : [];
+    return CAST.filter(c => c.voice === tag && !used.has(c.id) && !NO_REPLY.has(c.id) && !isBlocked(c.id)).map(c => c.id);
   }
   function lineFor(id, topics, tone) {
     const v = C[id].voice;
@@ -672,7 +733,15 @@
     insult: [['insult', 0.6], ['pileon', 0.15]], nice: [['nice', 0.6]] };
   function buildReplies(p, n) {
     const used = new Set(), out = [];
-    p.mentions.forEach(id => { if (out.length < n && !used.has(id) && !NO_REPLY.has(id)) { used.add(id); out.push({ by: id, text: lineFor(id, p.topics, p.tone) }); } });
+    p.mentions.forEach(id => {
+      if (out.length >= n || used.has(id) || NO_REPLY.has(id) || isBlocked(id)) return;
+      used.add(id);
+      if (T && AM.REACT && p.tone === 'insult') {
+        const r = reactToInsult(id, p.hostile || { word: null });
+        out.push({ by: id, text: r.text, done: true, block: r.block });
+        if (Math.random() < 0.55) { const dfd = defenderFor(id, used); if (dfd) { used.add(dfd.by); out.push(Object.assign(dfd, { done: true })); } }
+      } else out.push({ by: id, text: lineFor(id, p.topics, p.tone) });
+    });
     if (p.topics.includes('overheard') && !S.revealT && progress(now()) > 0.08 && Math.random() < 0.5) { used.add('overheard'); out.push({ by: 'overheard', text: pick(ST.overheardReplies || ['👀']) }); }
     if (T) {
       // People with history show up first: rivals to needle you, friends to back you up.
@@ -701,7 +770,7 @@
       const o = drawFrom(pool, used);
       if (o) out.push(o);
     }
-    return out.map(o => ({ by: o.by, text: style(o.by, scrub(fill(o.text))) }));
+    return out.map(o => (o.done ? o : { by: o.by, text: style(o.by, scrub(fill(o.text))) }));
   }
   function playerPost(o) {
     const t = now(), id = 'me' + (++S.seq), text = (o.text || '').trim();
@@ -709,7 +778,8 @@
     const tone = T ? detectTone(text) : null, echo = T ? echoOf(text) : null;
     const mentions = (text.match(/@([a-z0-9_.]+)/gi) || [])
       .map(m => CAST.find(c => c.handle.toLowerCase() === m.slice(1).toLowerCase().replace(/\.$/, ''))).filter(Boolean).map(c => c.id);
-    if (tone) mentions.forEach(id => bump(id, { insult: -3, rage: -2, snark: -2, nice: 2 }[tone]));
+    const hostile = T ? hostility(text, false) : null;
+    if (tone && tone !== 'insult') mentions.forEach(id => bump(id, { rage: -2, snark: -2, nice: 2 }[tone]));
     const F = followersNow(t);
     let likes = Math.pow(Math.max(F, 10), 0.78) * rand(0.2, 1.2), mult = 1;
     if (o.photo) mult *= 1.5;
@@ -727,7 +797,7 @@
     likes = Math.max(2, Math.round(likes));
     const gain = Math.round(likes * 0.6 * Math.pow(Math.max(F, 10), -0.15) * (viral ? 1.5 : 1));
     const tau = clamp(S.flight.duration * 0.03, 25000, 12 * MIN) * (viral ? 1.6 : 1);
-    const p = { id, by: 'me', t, text, photo: o.photo || null, drawing: !!o.drawing, shot: !!o.shot, likes, gain, tau, topics, tone, echo, mentions, viral,
+    const p = { id, by: 'me', t, text, photo: o.photo || null, drawing: !!o.drawing, shot: !!o.shot, likes, gain, tau, topics, tone, echo, mentions, viral, hostile,
       replies: [], ms: 0, seed: AM.hash(id + ':' + S.flight.seed), tags: [] };
     addPost(p);
     S.mine.push(id);
@@ -747,6 +817,7 @@
     reps.forEach((rp, i) => {
       const likes = i === ratioIdx ? Math.round(p.likes * rand(1.3, 2.2)) : Math.round(p.likes * rand(0.01, 0.12) + Math.random() * 4);
       schedule({ t, kind: 'reply', post: p.id, by: rp.by, text: rp.text, likes, ratio: i === ratioIdx });
+      if (rp.block) schedule({ t: t + 900, kind: 'block', who: rp.by });
       t += rand(6000, 20000) * (1 + i * 0.3);
     });
     if (p.viral) {
@@ -760,10 +831,20 @@
     if (!p) return;
     const r = { id: 'mr' + (++S.seq), by: 'me', text, t: now(), likes: 0, to: toRid || null };
     p.replies.push(r);
+    const myReply = r;
     let target = toRid ? (p.replies.find(x => x.id === toRid) || {}).by : p.by;
     if (target === 'me') { const others = p.replies.filter(x => x.by !== 'me'); target = others.length ? pick(others).by : null; }
-    const tone = T ? detectTone(text) : null;
-    if (target && target !== 'me' && target !== 'overheard' && T && (tone === 'snark' || tone === 'rage' || tone === 'insult' || (tone === 'nice' && (S.argue[target] || relOf(target) <= -4)))) {
+    const tone = T ? detectTone(text, true) : null;
+    if (target && target !== 'me' && target !== 'overheard' && T && AM.REACT && tone === 'insult' && !isBlocked(target)) {
+      const re = reactToInsult(target, hostility(text, true)), at = now() + rand(2500, 6500);
+      schedule({ t: at, kind: 'reply', post: postId, by: target, text: re.text, to: myReply.id });
+      if (re.block) schedule({ t: at + 900, kind: 'block', who: target });
+      else if (Math.random() < 0.5) { const dfd = defenderFor(target); if (dfd) schedule({ t: at + rand(4000, 9000), kind: 'reply', post: postId, by: dfd.by, text: dfd.text, to: myReply.id }); }
+      saveSoon();
+      return;
+    }
+    if (target && isBlocked(target)) { saveSoon(); return; }
+    if (target && target !== 'me' && target !== 'overheard' && T && (tone === 'snark' || tone === 'rage' || (tone === 'nice' && (S.argue[target] || relOf(target) <= -4)))) {
       // An argument: the character escalates for three rounds, then exits. Being nice ends it.
       const round = S.argue[target] || 0;
       let pool;
@@ -1228,6 +1309,8 @@
     const warn = kidCheck(text);
     if (warn) { toast({ who: 'me', title: 'Hmm, try again', text: warn }); return; }
     const rid = ui.replyTo && ui.replyTo.post === pg.id ? ui.replyTo.rid : null;
+    const tp = postIndex.get(pg.id), tgt = rid ? ((tp && tp.replies.find(x => x.id === rid)) || {}).by : tp && tp.by;
+    if (tgt && tgt !== 'me' && isBlocked(tgt)) { toast({ who: tgt, title: '@' + C[tgt].handle + ' blocked you', text: 'You can\'t reply to them. Try an apology from their profile.' }); return; }
     sendReply(pg.id, text, rid);
     ta.value = ''; autoGrow(ta); ui.replyTo = null;
     const body = $('[data-role="body"]', pg.el);
@@ -1249,7 +1332,7 @@
       <div class="prof-banner" style="background-image:url(&quot;${AM.banner(a.hue, AM.hash(id + 'b'))}&quot;)"></div>
       <div class="prof-top">${avatarHTML(id, 'lg', false)}<div class="prof-actions">
         ${isMe ? `${S.landed ? '<button class="btn" data-act="show-wrapped">Flight recap</button>' : ''}<button class="btn" data-act="settings">Settings</button>`
-          : `<button class="btn" data-act="chat" data-who="${id}">Message</button><button class="btn ${S.following[id] ? '' : 'dark'}" data-act="follow" data-who="${id}">${S.following[id] ? 'Following' : 'Follow'}</button>`}
+          : `${isBlocked(id) ? (S.apologized[id] ? '<button class="btn" disabled>Apology sent</button>' : `<button class="btn" data-act="apologize" data-who="${id}">Apologize</button>`) : `<button class="btn" data-act="chat" data-who="${id}">Message</button>`}<button class="btn ${S.following[id] ? '' : 'dark'}" data-act="follow" data-who="${id}">${S.following[id] ? 'Following' : 'Follow'}</button>`}
       </div></div>
       <div class="prof-info"><h3>${esc(a.name)}${verHTML(a)}</h3><div class="handle">@${esc(a.handle)}${S.followedBy[id] && !W.kids ? ' <span class="follows-you">Follows you</span>' : ''}${relChip(id)}</div>
         <div class="bio">${isMe ? `Flying ${esc(S.player.from)} to ${esc(S.player.to)}. Feed packed, wifi not included.` : richText(c.bio)}</div>
@@ -1267,6 +1350,7 @@
   }
   function relChip(id) {
     if (W.kids || id === 'me') return '';
+    if (isBlocked(id)) return ' <span class="rel-chip beef">Blocked you</span>';
     const r = relOf(id);
     return r <= -4 ? ' <span class="rel-chip beef">Beef with you</span>' : r >= 4 ? ' <span class="rel-chip bff">Your fan</span>' : '';
   }
@@ -1315,11 +1399,12 @@
     });
     $('[data-role="status"]', pg.el).textContent = typing ? 'typing…' : '@' + a.handle;
     const opts = choiceOptions(d), ch = $('[data-role="choices"]', pg.el);
-    const sig = opts ? JSON.stringify(d.choices) : '';
+    const blocked = isBlocked(who);
+    const sig = (opts ? JSON.stringify(d.choices) : '') + (blocked ? ':blocked:' + !!S.apologized[who] : '');
     if (ch.dataset.sig !== sig) {
       ch.dataset.sig = sig;
-      ch.innerHTML = opts ? `<div class="choices"><div class="choices-label">Your reply</div>${opts.map((o, i) => `<button class="choice" data-act="choice" data-who="${who}" data-i="${i}">${esc(o.label)}</button>`).join('')}</div>` : '';
-      $('[data-role="composer"]', pg.el).hidden = !!opts;
+      ch.innerHTML = blocked ? `<div class="choices"><div class="choices-label">@${esc(a.handle)} blocked you</div><p class="blocked-note">You can't message them right now.</p>${S.apologized[who] ? '<p class="blocked-note">Apology sent. It\'s up to them now.</p>' : `<button class="choice" data-act="apologize" data-who="${who}">Send an apology</button>`}</div>` : opts ? `<div class="choices"><div class="choices-label">Your reply</div>${opts.map((o, i) => `<button class="choice" data-act="choice" data-who="${who}" data-i="${i}">${esc(o.label)}</button>`).join('')}</div>` : '';
+      $('[data-role="composer"]', pg.el).hidden = !!opts || blocked;
     }
   }
   function doSendDm() {
@@ -1560,7 +1645,7 @@
   function shakePin() { const d = $('#pin-dots'); if (!d) return; d.classList.remove('shake'); void d.offsetWidth; d.classList.add('shake'); setTimeout(renderPinDots, 200); }
 
   // ---------- kids safety ----------
-  const KID_BLOCK = /\b(fuck\w*|shit\w*|bitch\w*|ass(hole)?s?|bastard|damn\w*|crap|piss\w*|dick\w*|cock\w*|pussy|slut|whore|sex\w*|porn\w*|kill (yourself|urself)|kys|stupid|idiot|dumb|shut up|hate you|loser|ugly)\b/i;
+  const KID_BLOCK = /\b(fuck\w*|shit\w*|bitch\w*|ass(hole)?s?|bastard|damn\w*|crap|piss\w*|dick\w*|cock\w*|pussy|slut|whore|sex\w*|porn\w*|kill (yourself|urself)|kys|stupid|idiot|dumb|shut up|hate you|loser|ugly|you suck|go away|nobody likes you)\b/i;
   const KID_PRIVATE = /(\d[\s.-]?){7,}|@\w+\.\w+|\b\d{1,5}\s+\w+\s+(street|st|road|rd|avenue|ave|lane|ln|drive|dr|court|ct)\b|\b(my address|i live (at|on)|my school is|my password)\b/i;
   function kidCheck(text) {
     if (!W.kids) return null;
@@ -1805,6 +1890,12 @@
       }
       case 'follow': S.following[d.who] = !S.following[d.who]; bump(d.who, S.following[d.who] ? 1.5 : -1.5); refreshOpen(); saveSoon(); break;
       case 'chat': openChat(d.who); break;
+      case 'apologize':
+        if (!isBlocked(d.who) || S.apologized[d.who]) break;
+        S.apologized[d.who] = true;
+        schedule({ t: now() + rand(8000, 20000), kind: 'apology', who: d.who });
+        toast({ who: 'me', title: 'Apology sent', text: first(C[d.who].name) + ' will see it. No promises.' });
+        refreshOpen(); saveSoon(); break;
       case 'learn-cat': ui.learnCat = d.v; renderLearn(); break;
       case 'learn-more': S.learned[d.id] = 'more'; rerenderCard(d.id); saveSoon(); break;
       case 'bust': S.learned[d.id] = 'busted'; rerenderCard(d.id); saveSoon(); break;
@@ -1898,7 +1989,7 @@
   }
   // Old saves predate some fields; fill them in so the engine never meets an undefined.
   function migrate(s) {
-    ['rel', 'argue', 'learned', 'quiz', 'dmSent', 'followedBy'].forEach(k => { if (!s[k]) s[k] = {}; });
+    ['rel', 'argue', 'learned', 'quiz', 'dmSent', 'followedBy', 'blocked', 'insults', 'apologized'].forEach(k => { if (!s[k]) s[k] = {}; });
     s.world = s.world === 'kids' && AM.KIDS ? 'kids' : 'city';
     if (!ST || ST !== (s.world === 'kids' ? AM.KIDS.STORY : AM.STORY)) useWorld(s.world);
     if (!ST.game.teams.includes(s.flight.winner)) s.flight.winner = ST.game.teams[0];
