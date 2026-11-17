@@ -608,6 +608,14 @@ svg { display: block; }
 .bubble.sys { align-self: center; background: none; color: var(--muted); font-size: 13px; padding: 4px 8px; }
 .blocked-note { margin: 0; color: var(--muted); font-size: 14px; }
 
+/* ---------- AI replies + updates ---------- */
+.ai-row .ai-pick { flex-wrap: wrap; }
+.ai-bar { display: block; height: 6px; margin: 8px 0 4px; border-radius: 3px; background: var(--raised); overflow: hidden; }
+.ai-bar i { display: block; height: 100%; background: var(--accent); transition: width 0.4s ease; }
+.ai-err { color: var(--like); }
+.update-pill { position: absolute; left: 50%; bottom: 72px; transform: translateX(-50%); z-index: 76; height: 40px; padding: 0 18px; border-radius: 20px;
+  background: var(--accent); color: var(--accent-ink); font-weight: 700; font-size: 14px; box-shadow: var(--shadow); white-space: nowrap; animation: drop 0.3s ease-out; }
+
 </style>
 </head>
 <body>
@@ -6196,6 +6204,145 @@ window.AM = window.AM || {};
   };
 })();
 
+/* ---- js/ai.js ---- */
+// Airplane Mode: on-device AI replies. A small language model runs in the browser on the phone's GPU
+// (WebLLM over WebGPU). It downloads once on wifi, the browser keeps it, and from then on it writes replies
+// with no connection. The rules engine still decides who replies and how they feel; the model only writes
+// the words, and every line keeps a pre-written fallback, so a slow or missing model never stalls the feed.
+window.AM = window.AM || {};
+
+(function () {
+  const LIB = 'https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.87/lib/index.js';
+  const KEY = 'airplane-mode/ai';
+  const MODELS = {
+    standard: { label: 'Standard', size: '670 MB', f16: 'Llama-3.2-1B-Instruct-q4f16_1-MLC', f32: 'Llama-3.2-1B-Instruct-q4f32_1-MLC' },
+    best: { label: 'Best', size: '1.7 GB', f16: 'Llama-3.2-3B-Instruct-q4f16_1-MLC', f32: 'Llama-3.2-3B-Instruct-q4f32_1-MLC' }
+  };
+  const TIMEOUT = 45000;
+
+  const AI = AM.AI = { state: 'off', progress: 0, detail: '', tier: null, model: null, stats: { n: 0, ms: 0, out: 0, last: null }, MODELS };
+  const listeners = new Set();
+  let lib = null, engine = null, loading = null, busy = false, f16 = null, restarts = 0;
+  const GPU_LOST = /disposed|instance|device|lost|gpu|operationerror|not loaded/i;
+  // The browser can drop the GPU (switching apps, memory pressure). Reload the model from storage,
+  // at most twice per session; after that, say so in Settings instead of retrying forever.
+  function recover() {
+    const old = engine;
+    engine = null; loading = null;
+    try { if (old) old.unload().catch(() => {}); } catch (e) { /* already gone */ }
+    if (restarts >= 2) { set('error', 'The AI stopped working. Turn it off and on again.'); return; }
+    restarts++;
+    set('loading', 'Restarting the AI');
+    setTimeout(() => AI.start(AI.tier).catch(() => {}), 1500);
+  }
+  const pending = [];
+
+  // The claude.ai viewer blocks the model download, so AI replies live in the installed app only.
+  const loc = window.location || { hostname: '', protocol: '' };
+  AI.inArtifact = !!window.claude || /claude\.ai$|claudeusercontent/.test(loc.hostname);
+  AI.supported = () => typeof navigator !== 'undefined' && !!navigator.gpu && !AI.inArtifact && /^https?:$/.test(loc.protocol);
+  AI.on = fn => { listeners.add(fn); return () => listeners.delete(fn); };
+  const emit = () => listeners.forEach(fn => { try { fn(AI); } catch (e) { /* a listener failing must not stop the others */ } });
+  const set = (state, detail) => { AI.state = state; if (detail != null) AI.detail = detail; emit(); };
+  const saved = () => { try { return JSON.parse(localStorage.getItem(KEY) || 'null'); } catch (e) { return null; } };
+  const save = v => { try { if (v) localStorage.setItem(KEY, JSON.stringify(v)); else localStorage.removeItem(KEY); } catch (e) { /* kept in memory */ } };
+  AI.installed = () => { const s = saved(); return s && s.model ? s : null; };
+
+  async function hasF16() {
+    if (f16 !== null) return f16;
+    try { const ad = await navigator.gpu.requestAdapter(); f16 = !!(ad && ad.features && ad.features.has('shader-f16')); } catch (e) { f16 = false; }
+    return f16;
+  }
+  async function loadLib() { if (!lib) lib = await import(LIB); return lib; }
+
+  // Downloads the model the first time, then loads it onto the GPU. Calling it again reuses the same work.
+  // `modelOverride` is for testing with a smaller model.
+  AI.start = function (tier, modelOverride) {
+    if (loading) return loading;
+    loading = (async () => {
+      if (!AI.supported()) { set('unsupported', ''); throw new Error('unsupported'); }
+      const s = saved();
+      tier = tier || (s && s.tier) || 'standard';
+      const id = modelOverride || (s && s.tier === tier && s.model) || MODELS[tier][(await hasF16()) ? 'f16' : 'f32'];
+      AI.tier = tier;
+      set('loading', 'Getting ready');
+      const L = await loadLib();
+      const cached = await L.hasModelInCache(id).catch(() => false);
+      set(cached ? 'loading' : 'downloading', cached ? 'Waking up the AI' : 'Starting download');
+      if (!cached && navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+      engine = await L.CreateMLCEngine(id, {
+        initProgressCallback: r => { AI.progress = r.progress || 0; AI.detail = r.text || ''; emit(); }
+      });
+      AI.model = id;
+      save({ tier, model: id });
+      set('loading', 'Warming up');
+      try { await engine.chat.completions.create({ messages: [{ role: 'user', content: 'Say hi.' }], max_tokens: 2 }); } catch (e) { /* the real replies will try again */ }
+      set('ready', '');
+      pump();
+      return engine;
+    })().catch(err => {
+      loading = null; engine = null;
+      if (AI.state !== 'unsupported') set('error', String((err && err.message) || err).slice(0, 160));
+      throw err;
+    });
+    return loading;
+  };
+
+  // Writes one reply. Jobs run one at a time, most urgent first (a DM the player is waiting on beats a
+  // reply to an old post), and each has a deadline.
+  AI.write = function (messages, opts) {
+    opts = opts || {};
+    return new Promise((resolve, reject) => {
+      pending.push({ messages, opts, resolve, reject, prio: opts.priority || 1, at: Date.now() });
+      pump();
+    });
+  };
+  async function pump() {
+    if (busy || AI.state !== 'ready' || !engine || !pending.length) return;
+    pending.sort((a, b) => b.prio - a.prio || a.at - b.at);
+    const job = pending.shift();
+    if (job.opts.stale && job.opts.stale()) { job.reject(new Error('stale')); setTimeout(pump, 0); return; }
+    busy = true;
+    let timer = 0;
+    try {
+      const t0 = performance.now();
+      const run = engine.chat.completions.create({ messages: job.messages, max_tokens: job.opts.max || 70,
+        temperature: job.opts.temp || 0.9, top_p: 0.95, frequency_penalty: 0.4 });
+      const timeout = new Promise((_, rej) => { timer = setTimeout(() => { try { engine.interruptGenerate(); } catch (e) { /* already done */ } rej(new Error('timeout')); }, TIMEOUT); });
+      const res = await Promise.race([run, timeout]);
+      const ms = performance.now() - t0, u = res.usage || {};
+      AI.stats.n++; AI.stats.ms += ms; AI.stats.out += u.completion_tokens || 0;
+      AI.stats.last = { ms: Math.round(ms), prompt: u.prompt_tokens || 0, out: u.completion_tokens || 0 };
+      emit();
+      job.resolve(((res.choices && res.choices[0] && res.choices[0].message && res.choices[0].message.content) || '').trim());
+    } catch (err) {
+      job.reject(err);
+      if (GPU_LOST.test(String((err && (err.message || err)) || ''))) recover();
+    } finally {
+      clearTimeout(timer);
+      busy = false;
+      if (pending.length) setTimeout(pump, 0);
+    }
+  }
+  AI.queued = () => pending.length + (busy ? 1 : 0);
+  AI.debugDrop = async () => { try { if (engine) await engine.unload(); } catch (e) { /* fine */ } };
+
+  // Turns AI replies off and deletes the downloaded model from the phone.
+  AI.remove = async function () {
+    const s = saved();
+    pending.splice(0).forEach(j => j.reject(new Error('removed')));
+    try { if (engine) await engine.unload(); } catch (e) { /* nothing loaded */ }
+    engine = null; loading = null;
+    if (s && s.model) { try { const L = await loadLib(); await L.deleteModelAllInfoInCache(s.model); } catch (e) { /* already gone */ } }
+    save(null);
+    AI.tier = null; AI.model = null; AI.progress = 0;
+    set('off', '');
+  };
+
+  // On launch, wake the model back up if the player turned AI replies on before.
+  AI.resume = function () { if (AI.installed() && AI.supported() && !loading) AI.start().catch(() => {}); };
+})();
+
 /* ---- js/app.js ---- */
 // Airplane Mode: the world engine (flight clock, story, reactions) and the app UI.
 // Everything runs on this device. Time is real: the story is paced to the flight length the player
@@ -6203,6 +6350,7 @@ window.AM = window.AM || {};
 (function () {
   'use strict';
 
+  const APP_VERSION = '0.3.0';
   const MIN = 60000;
   const KEY = 'airplane-mode/v1';
 
@@ -6507,6 +6655,9 @@ window.AM = window.AM || {};
     for (let i = 0; i < n; i++) S.slots.push(start + ((i + 0.3 + r() * 0.4) / n) * 0.985 * duration);
     addNotif({ t: start, type: 'flight', html: `Welcome aboard, <b>${esc(first(b.name))}</b>. Your feed is packed for a ${esc(fmtFlight(b.dur))} flight. Everyone here is AI and make-believe, and nothing you post leaves this phone.` });
     ST.welcome.forEach((m, i) => schedule({ t: start + 4000 + i * 3500, kind: 'dm', who: m.who, text: m.text }));
+    if (!W.kids && AM.AI && AM.AI.supported() && !AM.AI.installed()) {
+      addNotif({ t: start + 1, type: 'flight', html: '<b>New: AI replies.</b> Characters can read what you write and answer it, with no internet. Download it once on wifi in Settings.', go: { settings: true } });
+    }
     save();
   }
 
@@ -6525,7 +6676,12 @@ window.AM = window.AM || {};
       if (!b.when || b.when(S.flags, ctx())) runBeat(b, bt);
     }
     while (S.slotIdx < S.slots.length && S.slots[S.slotIdx] <= t) { spawnFiller(S.slots[S.slotIdx]); S.slotIdx++; changed = true; }
-    while (S.queue.length && S.queue[0].t <= t) { runEvent(S.queue.shift()); changed = true; }
+    while (S.queue.length && S.queue[0].t <= t) {
+      const e = S.queue.shift();
+      if (e.ai === 1 && t - (e.due || (e.due = e.t)) < 30000) { e.t = t + 800; schedule(e); continue; }
+      if (e.ai === 1) e.ai = 3;
+      runEvent(e); changed = true;
+    }
     if (checkMilestones(t)) changed = true;
     if (!S.landed && progress(t) >= 1) { S.landed = true; changed = true; }
     if (S.landed && !S.wrapped && !ui.board) { S.wrapped = true; changed = true; setTimeout(showWrapped, 1500); }
@@ -6619,6 +6775,7 @@ window.AM = window.AM || {};
     const aboutOH = TOPICS[0][1].test(low) || /secret|leak|\btea\b|clue/.test(low);
     const tone = T ? detectTone(text, true) : null;
     if (T && AM.REACT && tone === 'insult' && who !== 'overheard') return Object.assign(reactToInsult(who, hostility(text, true)), { styled: true });
+    const scripted = who === 'overheard' || (c.suspect && !S.revealT && (aboutOH || /\bis it you\b|\bare you\b|\bit'?s you\b/.test(low)));
     if (tone && who !== 'overheard') bump(who, { rage: -1, snark: -1, nice: 1.5 }[tone]);
     let pool;
     if (who === 'overheard') pool = S.revealT ? (ST.overheardRetired || ST.overheardDm) : ST.overheardDm;
@@ -6629,13 +6786,13 @@ window.AM = window.AM || {};
     else if (aboutOH && !S.revealT && R.dmOverheard.length) pool = R.dmOverheard;
     else if (/^\s*(hi+|hey+|hello|yo|sup|hiya|howdy|gm|good (morning|evening|afternoon))\b/.test(low) && (R.dmHello[v] || []).length) pool = R.dmHello[v];
     else pool = (R.dm[v] || []).length ? R.dm[v] : ['haha wait tell me more', 'ok but are you on a plane right now'];
-    return { text: pickFresh(pool, 'dm' + who) };
+    return { text: pickFresh(pool, 'dm' + who), kind: scripted ? null : tone || 'dm' };
   }
   function sendDm(who, text) {
     if (isBlocked(who)) return;
     pushMsg(who, { from: 'me', text, t: now() });
-    const r = dmReply(who, text), at = now() + rand(2600, 6200);
-    schedule({ t: at, kind: 'dm', who, text: r.text, styled: !!r.styled });
+    const r = dmReply(who, text), at = now() + rand(2600, 6200), ev = { t: at, kind: 'dm', who, text: r.text, styled: !!r.styled };
+    schedule(r.kind ? aiAttach(ev, who, r.kind === 'insult' ? 'clap' : r.kind, { dm: dmHistory(who) }, 4) : ev);
     if (r.block) schedule({ t: at + 900, kind: 'block', who });
     refreshOpen(); saveSoon();
   }
@@ -6871,15 +7028,15 @@ window.AM = window.AM || {};
     S.insults[id] = (S.insults[id] || 0) + (h.harsh ? 2 : 1);
     bump(id, h.harsh ? -5 : -3);
     const say = line => style(id, scrub(fill(String(line).replace(/\{insult\}/g, h.word || '').replace(/\{seat\}/g, S.player.seat))));
-    if (S.insults[id] >= X.patience[kind]) { S.blocked[id] = true; S.argue[id] = 0; return { text: say(pick(X.block[kind])), block: true }; }
-    if (h.harsh && Math.random() < 0.6) return { text: say(pick(X.harsh)) };
+    if (S.insults[id] >= X.patience[kind]) { S.blocked[id] = true; S.argue[id] = 0; return { text: say(pick(X.block[kind])), block: true, kind: 'block' }; }
+    if (h.harsh && Math.random() < 0.6) return { text: say(pick(X.harsh)), kind: 'harsh' };
     if (kind === 'clap') {
-      if (h.word && Math.random() < 0.55) return { text: say(pickFresh(X.clapEcho, 'ce')) };
-      return { text: say(pickTagged(T.escalate[Math.min(2, S.insults[id] - 1)], id) || 'Bold of you.') };
+      if (h.word && Math.random() < 0.55) return { text: say(pickFresh(X.clapEcho, 'ce')), kind: 'clap' };
+      return { text: say(pickTagged(T.escalate[Math.min(2, S.insults[id] - 1)], id) || 'Bold of you.'), kind: 'clap' };
     }
-    if (kind === 'hurt') return { text: say(h.word && Math.random() < 0.35 ? pickFresh(X.hurtEcho, 'he') : pickTagged(X.hurt, id) || 'Okay. That hurt.') };
-    if (kind === 'bot') return { text: say(pickFresh(X.bot, 'bo')) };
-    return { text: say(pickTagged(X[kind], id) || 'Noted.') };
+    if (kind === 'hurt') return { text: say(h.word && Math.random() < 0.35 ? pickFresh(X.hurtEcho, 'he') : pickTagged(X.hurt, id) || 'Okay. That hurt.'), kind };
+    if (kind === 'bot') return { text: say(pickFresh(X.bot, 'bo')), kind };
+    return { text: say(pickTagged(X[kind], id) || 'Noted.'), kind };
   }
   // Someone nearby sticks up for the person you insulted in public.
   function defenderFor(victim, used) {
@@ -6888,6 +7045,92 @@ window.AM = window.AM || {};
     const by = pick(pool).id;
     bump(by, -1);
     return { by, text: style(by, scrub(fill(pickFresh(AM.REACT.defend, 'df').replace(/\{victim\}/g, first(C[victim].name))))) };
+  }
+  // ---------- on-device AI ----------
+  // With the AI downloaded, the model writes a reply in the character's voice for the situation the rules
+  // engine already chose (who answers, and whether they're hurt, clapping back or blocking you). The
+  // pre-written line stays on the event as the fallback.
+  const aiOn = () => !!(AM.AI && AM.AI.state === 'ready' && T && !W.kids);
+  const AI_RULES = 'You write one short social media reply in character, set in a made-up city called Harbor City. ' +
+    'Keep it under 35 words. Write only the reply itself: no quotation marks around it, no name label, no hashtags unless they fit the character. ' +
+    'Keep it PG-13: no slurs, no sexual content, no threats. Never mention being an AI. ' +
+    'Do not mention real people, celebrities, brands, apps, movies, shows, songs or news; invent local ones if you need them. ' +
+    'Talk to the passenger as "you" or by their name, and never guess their gender. ' +
+    'If anyone asks who runs the gossip account @overheard_hc, you do not know, and if they ask whether it is you, deny it.';
+  const MOODS = {
+    topic: 'Reply naturally to what they posted.',
+    echo: 'Reply to what they posted, quoting a few of their words back.',
+    snark: 'They were sarcastic. Be sarcastic right back.',
+    rage: 'It is rage bait. Take the bait: be dramatically, comically outraged.',
+    unbothered: 'It is rage bait. Stay calm and smug, completely unbothered.',
+    pileon: 'Pile on with a playful roast, like everyone is dunking on it.',
+    insult: 'They were rude. Roast them back, playfully.',
+    nice: 'They were kind. Be warm back.',
+    rival: 'You have a running rivalry with them. Needle them playfully.',
+    friend: 'You are a big fan of theirs. Hype them up.',
+    clap: 'That was an insult aimed at you. Clap back with a witty, playful roast. You can quote their insult.',
+    hurt: 'That was an insult aimed at you and it hurt. Reply briefly, a little hurt but with dignity.',
+    deflect: 'That was an insult aimed at you. Brush it off with a joke.',
+    formal: 'That was an insult aimed at you. Reply coldly and briefly; you will not engage.',
+    pr: 'That was an insult aimed at your brand. Reply in polite corporate social-media PR-speak.',
+    bot: 'That was an insult aimed at you. Reply like an automated weather bot: deadpan and robotic.',
+    harsh: 'That insult crossed a line. Tell them so, briefly.',
+    block: 'You are done with them and about to block them. Write one short final line.',
+    argue1: 'They are arguing with you. Fire back, mildly.',
+    argue2: 'They keep arguing. Get more heated, theatrically.',
+    argue3: 'They still keep arguing. Maximum theatrical drama.',
+    exit: 'You are bowing out of this argument. Leave with a punchline.',
+    makeup: 'After arguing, they made peace. Accept it, with a little attitude.',
+    followup: 'They replied to you. Answer once more, briefly.',
+    dm: 'Reply to their latest message.'
+  };
+  const aiPersona = id => { const c = C[id]; return `You are ${c.name} (@${c.handle}). Bio: ${c.bio}. How you write: ${c.style}`; };
+  const quoteIt = s => '"' + String(s || '').replace(/\s+/g, ' ').trim().slice(0, 280) + '"';
+  function aiTask(kind, x) {
+    const who = `${S.player.name} (@${S.player.handle}), a passenger on a flight`;
+    const mood = MOODS[kind] || MOODS.topic;
+    if (x.dm) return `Your private messages with ${who}, oldest first:\n${x.dm}\n${mood}`;
+    if (x.victim) return `${who} just insulted ${x.victim} in public: ${quoteIt(x.text)}. Stand up for ${x.victim} in one short reply aimed at them.`;
+    if (x.prev) return `You said: ${quoteIt(x.prev)}. ${who} answered: ${quoteIt(x.text)}. ${mood}`;
+    return `${who} posted: ${quoteIt(x.text || '(just a photo)')}${x.photo ? ` They attached a photo of ${x.photo}.` : ''} ${mood}`;
+  }
+  const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\  // A line from a [tag, text] pool that this character could say: their own lines, then their voice.');
+  const AI_BAD = /\b(as an ai|language model|i can'?t (help|assist|do that)|i cannot|i'?m sorry,? but|n+[i1]+g+|f+a+g+|r+e+t+a+r+d|sex\w*|porn\w*|nude|rape|suicid\w*|kill (yourself|urself|you)|kys)\b|<\||\[\/?inst/i;
+  // Small models sometimes drift into real platforms or leak code-like junk; those lines fall back.
+  const AI_OFFWORLD = /\b(twitter|tweet\w*|instagram|tiktok|facebook|reddit|youtube|snapchat|google|amazon|netflix|chatgpt|openai|x\.com)\b|[{}<>\\|`]|\)\)|'\)|https?:/i;
+  function aiClean(raw, id) {
+    const c = C[id];
+    // keep the first non-empty line only: anything after a line break is the model wandering off
+    let t = String(raw || '').split(/\n+/).map(x => x.trim()).filter(Boolean)[0] || '';
+    t = t.replace(/\s+/g, ' ').trim();
+    t = t.replace(new RegExp('^(' + reEsc(c.name) + '|@?' + reEsc(c.handle) + ')\\s*:\\s*', 'i'), '');
+    t = t.replace(/(\s#\w+){2,}\s*$/, '').trim(); // a pile of hashtags at the end
+    t = t.replace(/^(me|you|them|reply|response|answer)\s*:\s*/i, '');
+    t = t.replace(/^["“”'‘’]+|["“”'‘’]+$/g, '').trim();
+    if (t.length > 240) {
+      const cut = t.slice(0, 240), end = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('! '), cut.lastIndexOf('? '));
+      t = end > 60 ? cut.slice(0, end + 1) : cut.replace(/\s+\S*$/, '') + '…';
+    }
+    if (t.length < 2 || AI_BAD.test(t) || AI_OFFWORLD.test(t) || (t.match(/#/g) || []).length > 2) return null;
+    return t;
+  }
+  // Hands an event to the AI. `e.ai` is 1 while it writes, 2 when its line replaced the fallback, 3 when the
+  // fallback stays (too slow, filtered, or failed).
+  function aiAttach(e, id, kind, x, priority) {
+    if (!aiOn() || !C[id] || id === 'overheard') return e;
+    e.ai = 1;
+    AM.AI.write([{ role: 'system', content: AI_RULES + '\n' + aiPersona(id) }, { role: 'user', content: aiTask(kind, x || {}) }],
+      { priority: priority || 1, stale: () => e.ai !== 1 })
+      .then(raw => { const t = aiClean(raw, id); if (t) { e.text = style(id, scrub(t)); e.styled = true; e.ai = 2; } else e.ai = 3; })
+      .catch(() => { e.ai = 3; });
+    return e;
+  }
+  const photoOf = p => (!p.photo ? null : p.drawing ? 'their own drawing'
+    : { view: 'the view out the plane window', food: 'some food', pet: 'a pet', selfie: 'themselves', plane: 'the plane' }[p.topics[0]] || 'something');
+  // The last few DM lines, written from the character's side.
+  function dmHistory(who) {
+    return (S.dms[who] ? S.dms[who].msgs : []).filter(m => m.from !== 'sys' && m.kind !== 'shot').slice(-6)
+      .map(m => (m.from === 'me' ? 'Them: ' : 'You: ') + String(m.text).slice(0, 200)).join('\n');
   }
   // A line from a [tag, text] pool that this character could say: their own lines, then their voice.
   function pickTagged(pool, id) {
@@ -6937,9 +7180,9 @@ window.AM = window.AM || {};
       used.add(id);
       if (T && AM.REACT && p.tone === 'insult') {
         const r = reactToInsult(id, p.hostile || { word: null });
-        out.push({ by: id, text: r.text, done: true, block: r.block });
-        if (Math.random() < 0.55) { const dfd = defenderFor(id, used); if (dfd) { used.add(dfd.by); out.push(Object.assign(dfd, { done: true })); } }
-      } else out.push({ by: id, text: lineFor(id, p.topics, p.tone) });
+        out.push({ by: id, text: r.text, done: true, block: r.block, mood: r.kind });
+        if (Math.random() < 0.55) { const dfd = defenderFor(id, used); if (dfd) { used.add(dfd.by); out.push(Object.assign(dfd, { done: true, victim: id })); } }
+      } else out.push({ by: id, text: lineFor(id, p.topics, p.tone), mood: p.tone || 'topic' });
     });
     if (p.topics.includes('overheard') && !S.revealT && progress(now()) > 0.08 && Math.random() < 0.5) { used.add('overheard'); out.push({ by: 'overheard', text: pick(ST.overheardReplies || ['👀']) }); }
     if (T) {
@@ -6947,19 +7190,19 @@ window.AM = window.AM || {};
       shuffle(Object.keys(S.rel || {})).forEach(id => {
         if (out.length >= n || used.has(id) || NO_REPLY.has(id) || !C[id]) return;
         const pool = relOf(id) <= -4 ? T.rivalReply : relOf(id) >= 4 ? T.friendReply : null;
-        if (pool && Math.random() < 0.7) { const line = pickTagged(pool, id); if (line) { used.add(id); out.push({ by: id, text: line }); } }
+        if (pool && Math.random() < 0.7) { const line = pickTagged(pool, id); if (line) { used.add(id); out.push({ by: id, text: line, mood: relOf(id) <= -4 ? 'rival' : 'friend' }); } }
       });
       if (p.echo && out.length < n && Math.random() < 0.6) {
         const o = drawFrom(T.echo[p.tone === 'insult' ? 'snark' : p.tone || 'neutral'] || T.echo.neutral, used, { echo: p.echo });
-        if (o) out.push(o);
+        if (o) out.push(Object.assign(o, { mood: 'echo' }));
       }
     }
     let guard = 0;
     while (out.length < n && guard++ < 140) {
-      let pool = null;
+      let pool = null, mood = 'topic';
       if (T && p.tone && guard < 70) {
         let roll = Math.random();
-        for (const [k, w] of TONE_MIX[p.tone]) { if (roll < w) { pool = T[k]; break; } roll -= w; }
+        for (const [k, w] of TONE_MIX[p.tone]) { if (roll < w) { pool = T[k]; mood = k; break; } roll -= w; }
       }
       if (!pool) {
         const tp = guard > 70 ? 'generic' : (Math.random() < 0.72 || p.topics.length === 1) ? p.topics[0] : pick(p.topics.slice(1).concat('generic'));
@@ -6967,9 +7210,9 @@ window.AM = window.AM || {};
       }
       if (!pool || !pool.length) continue;
       const o = drawFrom(pool, used);
-      if (o) out.push(o);
+      if (o) out.push(Object.assign(o, { mood }));
     }
-    return out.map(o => (o.done ? o : { by: o.by, text: style(o.by, scrub(fill(o.text))) }));
+    return out.map(o => (o.done ? o : { by: o.by, text: style(o.by, scrub(fill(o.text))), mood: o.mood }));
   }
   function playerPost(o) {
     const t = now(), id = 'me' + (++S.seq), text = (o.text || '').trim();
@@ -7015,7 +7258,8 @@ window.AM = window.AM || {};
     let t = p.t + rand(5000, 11000);
     reps.forEach((rp, i) => {
       const likes = i === ratioIdx ? Math.round(p.likes * rand(1.3, 2.2)) : Math.round(p.likes * rand(0.01, 0.12) + Math.random() * 4);
-      schedule({ t, kind: 'reply', post: p.id, by: rp.by, text: rp.text, likes, ratio: i === ratioIdx });
+      schedule(aiAttach({ t, kind: 'reply', post: p.id, by: rp.by, text: rp.text, likes, ratio: i === ratioIdx }, rp.by,
+        rp.victim ? 'defend' : rp.mood || 'topic', { text: p.text, photo: photoOf(p), victim: rp.victim ? first(C[rp.victim].name) : null }, 2));
       if (rp.block) schedule({ t: t + 900, kind: 'block', who: rp.by });
       t += rand(6000, 20000) * (1 + i * 0.3);
     });
@@ -7034,11 +7278,16 @@ window.AM = window.AM || {};
     let target = toRid ? (p.replies.find(x => x.id === toRid) || {}).by : p.by;
     if (target === 'me') { const others = p.replies.filter(x => x.by !== 'me'); target = others.length ? pick(others).by : null; }
     const tone = T ? detectTone(text, true) : null;
+    // what the target said that the player is answering
+    const theirs = toRid ? (p.replies.find(x => x.id === toRid) || {}).text : p.by === target ? p.text : null;
     if (target && target !== 'me' && target !== 'overheard' && T && AM.REACT && tone === 'insult' && !isBlocked(target)) {
       const re = reactToInsult(target, hostility(text, true)), at = now() + rand(2500, 6500);
-      schedule({ t: at, kind: 'reply', post: postId, by: target, text: re.text, to: myReply.id });
+      schedule(aiAttach({ t: at, kind: 'reply', post: postId, by: target, text: re.text, to: myReply.id }, target, re.kind, { prev: theirs, text }, 3));
       if (re.block) schedule({ t: at + 900, kind: 'block', who: target });
-      else if (Math.random() < 0.5) { const dfd = defenderFor(target); if (dfd) schedule({ t: at + rand(4000, 9000), kind: 'reply', post: postId, by: dfd.by, text: dfd.text, to: myReply.id }); }
+      else if (Math.random() < 0.5) {
+        const dfd = defenderFor(target);
+        if (dfd) schedule(aiAttach({ t: at + rand(4000, 9000), kind: 'reply', post: postId, by: dfd.by, text: dfd.text, to: myReply.id }, dfd.by, 'defend', { victim: first(C[target].name), text }, 2));
+      }
       saveSoon();
       return;
     }
@@ -7046,19 +7295,19 @@ window.AM = window.AM || {};
     if (target && target !== 'me' && target !== 'overheard' && T && (tone === 'snark' || tone === 'rage' || (tone === 'nice' && (S.argue[target] || relOf(target) <= -4)))) {
       // An argument: the character escalates for three rounds, then exits. Being nice ends it.
       const round = S.argue[target] || 0;
-      let pool;
-      if (tone === 'nice') { pool = T.makeup; S.argue[target] = 0; bump(target, 5); }
-      else if (round >= 3) { pool = T.exit; S.argue[target] = 0; bump(target, -1); }
-      else { pool = T.escalate[round]; S.argue[target] = round + 1; bump(target, tone === 'insult' ? -3 : -2); }
+      let pool, mood;
+      if (tone === 'nice') { pool = T.makeup; mood = 'makeup'; S.argue[target] = 0; bump(target, 5); }
+      else if (round >= 3) { pool = T.exit; mood = 'exit'; S.argue[target] = 0; bump(target, -1); }
+      else { pool = T.escalate[round]; mood = 'argue' + (round + 1); S.argue[target] = round + 1; bump(target, tone === 'insult' ? -3 : -2); }
       const line = pickTagged(pool, target);
-      if (line) schedule({ t: now() + rand(3000, 8000), kind: 'reply', post: postId, by: target, text: style(target, scrub(fill(line))), to: r.id });
+      if (line) schedule(aiAttach({ t: now() + rand(3000, 8000), kind: 'reply', post: postId, by: target, text: style(target, scrub(fill(line))), to: r.id }, target, mood, { prev: theirs, text }, 3));
       saveSoon();
       return;
     }
     if (target && tone === 'nice') bump(target, 2);
     if (target && target !== 'me' && Math.random() < (toRid ? 0.9 : 0.7)) {
       const line = target === 'overheard' ? pick(S.revealT ? (ST.overheardRetired || ST.overheardReplies) : ST.overheardReplies) : pickFresh(R.followup[C[target].voice] || ['fair enough'], 'fu' + target);
-      schedule({ t: now() + rand(4000, 12000), kind: 'reply', post: postId, by: target, text: style(target, scrub(fill(line))), to: r.id });
+      schedule(aiAttach({ t: now() + rand(4000, 12000), kind: 'reply', post: postId, by: target, text: style(target, scrub(fill(line))), to: r.id }, target, tone === 'nice' ? 'nice' : 'followup', { prev: theirs, text }, 3));
       if (Math.random() < 0.5) schedule({ t: now() + rand(2500, 8000), kind: 'likeReply', post: postId, rid: r.id, by: target });
     }
     saveSoon();
@@ -7703,8 +7952,32 @@ window.AM = window.AM || {};
         ? `<div class="setting-row"><span><b>Leave kids mode</b><small>Ends this flight and opens a grown-up boarding pass.</small></span><button class="btn" data-act="mode-switch" data-v="city">Leave</button></div>
            <div class="setting-row"><span><b>Parent PIN</b><small>Choose a new PIN for kids mode.</small></span><button class="btn" data-act="pin-change">Change</button></div>`
         : `<div class="setting-row"><span><b>Kids mode</b><small>Treetop Town: animal friends, jokes and learning. Locked with a parent PIN.</small></span><button class="btn" data-act="mode-switch" data-v="kids">Set up</button></div>`) : ''}
-      <div class="setting-row"><span><b>About this prototype</b><small>Every account here is AI-written and make-believe, and nothing you post leaves this phone. The whole feed is packed before takeoff. In the full app, an on-device AI model would write replies live; this prototype picks them from a large pre-written set.</small></span></div>`);
+      <div class="setting-row ai-row" id="ai-row">${aiRowHTML()}</div>
+      <div class="setting-row"><span><b>About</b><small>Airplane Mode ${APP_VERSION}. Every account here is make-believe, and nothing you post leaves this phone. The feed is packed before takeoff; with AI replies on, a model on this phone writes replies to what you say.</small></span></div>`);
   }
+  function aiRowHTML() {
+    const A = AM.AI, head = '<span><b>AI replies</b><small>';
+    if (!A) return '';
+    if (W.kids) return head + 'Off in kids mode. Kids always get the hand-written lines.</small></span>';
+    if (A.inArtifact) return head + 'Works in the installed app at mrvk64.github.io/airplane-mode, not on this page.</small></span>';
+    if (!A.supported()) return head + 'This browser can\'t run on-device AI, so replies use the built-in lines.</small></span>';
+    const pct = Math.round((A.progress || 0) * 100);
+    if (A.state === 'downloading' || A.state === 'loading') {
+      return head + (A.state === 'downloading' ? 'Downloading the AI. Keep the app open.' : 'Waking up the AI.') +
+        `</small><span class="ai-bar"><i style="width:${pct}%"></i></span><small>${pct}% · ${esc(trimText(A.detail || '', 60))}</small></span>`;
+    }
+    if (A.state === 'ready') {
+      const l = A.stats.last, m = A.MODELS[A.tier] || A.MODELS.standard;
+      return head + `On (${m.label}). Characters read what you write and answer it.${l ? ' Last reply took ' + (l.ms / 1000).toFixed(1) + ' s.' : ''}</small></span>` +
+        `<button class="btn" data-act="ai-remove">${ui.confirmAi ? 'Tap again to delete' : 'Turn off'}</button>`;
+    }
+    const err = A.state === 'error' ? `<small class="ai-err">That didn't work: ${esc(A.detail)}. Try again on wifi.</small>` : '';
+    const best = (navigator.deviceMemory || 4) >= 8;
+    return head + 'Characters read what you write and answer it, with no internet. It downloads once, so use wifi.</small>' + err + '</span>' +
+      `<span class="btn-row ai-pick"><button class="btn${best ? '' : ' dark'}" data-act="ai-start" data-v="standard">Standard · 670 MB</button>` +
+      `<button class="btn${best ? ' dark' : ''}" data-act="ai-start" data-v="best">Best · 1.7 GB</button></span>`;
+  }
+  function renderAiRow() { const el = $('#ai-row'); if (el) el.innerHTML = aiRowHTML(); }
   // Drawing pad: kids post doodles instead of photos (grown-ups can doodle too).
   const DRAW_COLORS = ['#1F2430', '#E5484D', '#F28C28', '#F2C200', '#2EAE5A', '#2D6BE0', '#8E5BD6', '#FF7AB6', '#8B5A2B', '#FFFFFF'];
   function openDraw() {
@@ -7947,6 +8220,7 @@ window.AM = window.AM || {};
     renderAll();
     startTicking();
     tick();
+    if (AM.AI && !W.kids) AM.AI.resume();
     el.classList.add('away');
     setTimeout(() => el.remove(), 480);
   }
@@ -8005,6 +8279,7 @@ window.AM = window.AM || {};
     else if (g.post) { if (postIndex.get(g.post)) pushPage({ type: 'thread', id: g.post }); }
     else if (g.profile) pushPage({ type: 'profile', id: g.profile });
     else if (g.tab) { closeAllPages(); setTab(g.tab); }
+    else if (g.settings) { if (W.kids) pinSheet('check', openSettings); else openSettings(); }
   }
   function openChat(who) { if (!chatOpen(who)) pushPage({ type: 'chat', id: who }); }
   function closeAllPages() { while (ui.stack.length) popPage(); }
@@ -8089,6 +8364,11 @@ window.AM = window.AM || {};
       }
       case 'follow': S.following[d.who] = !S.following[d.who]; bump(d.who, S.following[d.who] ? 1.5 : -1.5); refreshOpen(); saveSoon(); break;
       case 'chat': openChat(d.who); break;
+      case 'ai-start': if (AM.AI) { AM.AI.start(d.v).catch(() => {}); renderAiRow(); } break;
+      case 'ai-remove':
+        if (!ui.confirmAi) { ui.confirmAi = true; renderAiRow(); break; }
+        ui.confirmAi = false; AM.AI.remove().then(renderAiRow); break;
+      case 'reload-app': save(); location.reload(); break;
       case 'apologize':
         if (!isBlocked(d.who) || S.apologized[d.who]) break;
         S.apologized[d.who] = true;
@@ -8192,6 +8472,7 @@ window.AM = window.AM || {};
     s.world = s.world === 'kids' && AM.KIDS ? 'kids' : 'city';
     if (!ST || ST !== (s.world === 'kids' ? AM.KIDS.STORY : AM.STORY)) useWorld(s.world);
     if (!ST.game.teams.includes(s.flight.winner)) s.flight.winner = ST.game.teams[0];
+    (s.queue || []).forEach(e => { if (e.ai === 1) e.ai = 3; }); // a reply the AI was writing when the app closed keeps its fallback
     return s;
   }
 
@@ -8206,6 +8487,17 @@ window.AM = window.AM || {};
     ['pointerdown', 'keydown', 'wheel', 'touchstart'].forEach(ev => document.addEventListener(ev, () => { ui.lastTouch = Date.now(); if (ev !== 'wheel') unlockAudio(); }, { passive: true }));
     $('#views').addEventListener('scroll', () => { ui.lastTouch = Date.now(); }, { capture: true, passive: true });
     $('#strip').addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('#strip').click(); } });
+    if (AM.AI) AM.AI.on(renderAiRow);
+    // A new version installs in the background; offer a restart instead of waiting for the next launch.
+    if ('serviceWorker' in navigator) {
+      const had = !!navigator.serviceWorker.controller;
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (!had || $('#overlay .update-pill')) return;
+        const b = document.createElement('button');
+        b.className = 'update-pill'; b.dataset.act = 'reload-app'; b.textContent = 'New version ready · Tap to restart';
+        $('#overlay').appendChild(b);
+      });
+    }
     if (!S) {
       // A sample world sits behind the boarding pass so the first frame shows what the app is.
       showBoarding(null);
@@ -8216,6 +8508,7 @@ window.AM = window.AM || {};
     renderAll();
     startTicking();
     tick();
+    if (AM.AI && !W.kids) AM.AI.resume();
   }
 
   // Diagnostics for testing and bug reports: __airplaneMode.skipTo(0.5) jumps the flight to 50%.
@@ -8226,6 +8519,7 @@ window.AM = window.AM || {};
     choose: (who, i) => choose(who, i),
     reply: (postId, text, rid) => sendReply(postId, text, rid),
     dm: (who, text) => sendDm(who, text),
+    ai: () => AM.AI,
     tick: () => tick()
   };
 

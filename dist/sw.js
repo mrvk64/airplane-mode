@@ -8,14 +8,15 @@
 // activate  deletes older airplanemode-* caches only. Other apps on the same github.io address (Gate Rush)
 //           keep theirs.
 // fetch     the app's own files come from the cache first, so a refresh at 37,000 feet still works.
-//           Google Fonts are cached the first time they load and reused offline. Anything else goes to
-//           the network.
+//           Google Fonts and the AI library are cached the first time they load and reused offline.
+//           Anything else goes to the network (the AI model keeps its own storage).
 'use strict';
 
-const VERSION = 'bf5ffe036b382';
+const VERSION = 'bd97823367ab2';
 const PREFIX = 'airplanemode-';
 const APP_CACHE = PREFIX + VERSION;
 const FONT_CACHE = PREFIX + 'fonts';
+const VENDOR_CACHE = PREFIX + 'vendor'; // the pinned AI library; its URL has the version, so it never changes
 const PRECACHE = ['./', './index.html', './manifest.webmanifest', './icons/icon-192.png', './icons/icon-512.png',
   './icons/icon-maskable-192.png', './icons/icon-maskable-512.png', './icons/apple-touch-icon.png', './icons/favicon-32.png'];
 
@@ -30,7 +31,7 @@ self.addEventListener('install', event => {
 self.addEventListener('activate', event => {
   event.waitUntil(
     caches.keys()
-      .then(keys => Promise.all(keys.filter(k => k.startsWith(PREFIX) && k !== APP_CACHE && k !== FONT_CACHE).map(k => caches.delete(k))))
+      .then(keys => Promise.all(keys.filter(k => k.startsWith(PREFIX) && k !== APP_CACHE && k !== FONT_CACHE && k !== VENDOR_CACHE).map(k => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
@@ -47,6 +48,14 @@ self.addEventListener('fetch', event => {
       return;
     }
     event.respondWith(caches.match(req, { cacheName: APP_CACHE, ignoreSearch: true }).then(hit => hit || fetch(req)));
+    return;
+  }
+
+  // The AI library (loaded only when AI replies are on) is kept so it loads offline. The model itself is
+  // stored by the library in its own caches, which this worker never touches.
+  if (url.hostname === 'cdn.jsdelivr.net' && url.pathname.startsWith('/npm/@mlc-ai/web-llm@')) {
+    event.respondWith(caches.open(VENDOR_CACHE).then(cache => cache.match(req).then(hit => hit ||
+      fetch(req).then(res => { if (res && res.ok) cache.put(req, res.clone()); return res; }))));
     return;
   }
 

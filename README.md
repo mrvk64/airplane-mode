@@ -59,5 +59,19 @@ The icons come from `node tools/make-icons.js` (writes `site/icons/`); you only 
 
 `__airplaneMode.skipTo(0.5)` in the browser console jumps the current flight to 50%, which is handy for testing.
 
-In a real phone app, an on-device AI model would write replies live; this prototype picks them from a large
-pre-written set.
+## AI replies
+
+In the installed app, Settings → AI replies downloads a small language model once (Standard: Llama 3.2 1B,
+670 MB; Best: Llama 3.2 3B, 1.7 GB). It runs on the phone's GPU through WebLLM (`src/js/ai.js`, pinned to
+0.2.87 from jsDelivr) and keeps working offline.
+
+- The rules engine still decides who replies and how they feel (hurt, clapping back, blocking); the model
+  only writes the words.
+- Every reply keeps its pre-written line as a fallback. The app waits up to 30 seconds for the model, then
+  posts the fallback.
+- Lines that mention real platforms or brands, contain code-like junk, or fail the safety filter are thrown
+  out.
+- If the browser drops the GPU, the model reloads from storage (at most twice per session).
+- Kids mode never uses the model.
+
+The claude.ai artifact can't download the model, so it always uses the pre-written lines.
