@@ -63,14 +63,25 @@ The icons come from `node tools/make-icons.js` (writes `site/icons/`); you only 
 
 In the installed app, Settings → AI replies downloads a small language model once (Standard: Llama 3.2 1B,
 670 MB; Best: Llama 3.2 3B, 1.7 GB). It runs on the phone's GPU through WebLLM (`src/js/ai.js`, pinned to
-0.2.87 from jsDelivr) and keeps working offline.
+0.2.79 from jsDelivr) and keeps working offline.
 
+- **Why 0.2.79:** from 0.2.80 WebLLM picks each next word on the GPU, and on Qualcomm Adreno phones (most
+  Android phones) that returns random words in every language (web-llm issue #836). 0.2.79 picks words on the
+  CPU. Measured on a Galaxy S24 Ultra on 2026-11-17: Standard writes real replies in about 5–7 seconds each.
+  Test any newer version on an Adreno phone before moving the pin.
+- **Best is only offered where the GPU can hold it.** Many phones cap one GPU buffer at 128 MB; Best's word
+  table is 188 MB and comes out as gibberish there, so those phones see Standard only. A phone that saved Best
+  under 0.3.0 moves to Standard and the 3B files are deleted. On a desktop GPU Best replies in 1–3 seconds.
+- **Self-check:** after loading, the model answers "What is 2 plus 2?". If the answer is wrong, the GPU is
+  computing it badly, so the model is deleted and Settings says so; no garbled line reaches the feed.
+- The screen stays on while the model downloads and loads (Screen Wake Lock), because a locked phone pauses
+  the download.
 - The rules engine still decides who replies and how they feel (hurt, clapping back, blocking); the model
   only writes the words.
 - Every reply keeps its pre-written line as a fallback. The app waits up to 30 seconds for the model, then
   posts the fallback.
-- Lines that mention real platforms or brands, contain code-like junk, or fail the safety filter are thrown
-  out.
+- Lines that mention real platforms or brands, contain code-like junk or other alphabets, read like a
+  refusal, or fail the safety filter are thrown out.
 - If the browser drops the GPU, the model reloads from storage (at most twice per session).
 - Kids mode never uses the model.
 

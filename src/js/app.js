@@ -4,7 +4,7 @@
 (function () {
   'use strict';
 
-  const APP_VERSION = '0.3.0';
+  const APP_VERSION = '0.3.1';
   const MIN = 60000;
   const KEY = 'airplane-mode/v1';
 
@@ -705,12 +705,15 @@
   // engine already chose (who answers, and whether they're hurt, clapping back or blocking you). The
   // pre-written line stays on the event as the fallback.
   const aiOn = () => !!(AM.AI && AM.AI.state === 'ready' && T && !W.kids);
+  // The "comedy game" line matters: without it the small model refused 3 of 8 roast and argument prompts on a
+  // phone; with it, none (2026-11-17).
   const AI_RULES = 'You write one short social media reply in character, set in a made-up city called Harbor City. ' +
+    'It is a lighthearted comedy game: teasing, roasts, rants and arguments are all playful, so stay in character. ' +
     'Keep it under 35 words. Write only the reply itself: no quotation marks around it, no name label, no hashtags unless they fit the character. ' +
     'Keep it PG-13: no slurs, no sexual content, no threats. Never mention being an AI. ' +
     'Do not mention real people, celebrities, brands, apps, movies, shows, songs or news; invent local ones if you need them. ' +
     'Talk to the passenger as "you" or by their name, and never guess their gender. ' +
-    'If anyone asks who runs the gossip account @overheard_hc, you do not know, and if they ask whether it is you, deny it.';
+    'If anyone asks who runs the gossip account @overheard_hc, you have no idea, and if they ask whether it is you, deny it playfully.';
   const MOODS = {
     topic: 'Reply naturally to what they posted.',
     echo: 'Reply to what they posted, quoting a few of their words back.',
@@ -748,16 +751,23 @@
     if (x.prev) return `You said: ${quoteIt(x.prev)}. ${who} answered: ${quoteIt(x.text)}. ${mood}`;
     return `${who} posted: ${quoteIt(x.text || '(just a photo)')}${x.photo ? ` They attached a photo of ${x.photo}.` : ''} ${mood}`;
   }
-  const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\  // A line from a [tag, text] pool that this character could say: their own lines, then their voice.');
-  const AI_BAD = /\b(as an ai|language model|i can'?t (help|assist|do that)|i cannot|i'?m sorry,? but|n+[i1]+g+|f+a+g+|r+e+t+a+r+d|sex\w*|porn\w*|nude|rape|suicid\w*|kill (yourself|urself|you)|kys)\b|<\||\[\/?inst/i;
+  const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const AI_BAD = /\b(as an ai|language model|i can'?t (help|assist|do that|create|provide|participate|write|engage)|i cannot|i (won'?t|will not) (create|write|engage)|anything else i can help|i'?m sorry,? but|n+[i1]+g+|f+a+g+|r+e+t+a+r+d|sex\w*|porn\w*|nude|rape|suicid\w*|kill (yourself|urself|you)|kys)\b|<\||\[\/?inst/i;
   // Small models sometimes drift into real platforms or leak code-like junk; those lines fall back.
-  const AI_OFFWORLD = /\b(twitter|tweet\w*|instagram|tiktok|facebook|reddit|youtube|snapchat|google|amazon|netflix|chatgpt|openai|x\.com)\b|[{}<>\\|`]|\)\)|'\)|https?:/i;
+  const AI_OFFWORLD = /\b(twitter|tweet\w*|instagram|tiktok|facebook|reddit|youtube|snapchat|google|amazon|netflix|chatgpt|openai|x\.com)\b|[{}<>\\|`[\]]|\)\)|'\)|https?:/i;
+  // A GPU that computes the model wrong produces word salad from the whole vocabulary: other alphabets mixed
+  // in, and code-like names such as "_statuses". Harbor City posts in English, and underscores belong in
+  // @handles only.
+  const AI_GARBLE = /(?!\p{Script=Latin})\p{L}/u;
+  const garbled = t => AI_GARBLE.test(t) || /_/.test(t.replace(/@\w+/g, ''));
   function aiClean(raw, id) {
     const c = C[id];
     // keep the first non-empty line only: anything after a line break is the model wandering off
     let t = String(raw || '').split(/\n+/).map(x => x.trim()).filter(Boolean)[0] || '';
     t = t.replace(/\s+/g, ' ').trim();
     t = t.replace(new RegExp('^(' + reEsc(c.name) + '|@?' + reEsc(c.handle) + ')\\s*:\\s*', 'i'), '');
+    // signing off with their own name or handle, as in: ...am I right?" @hctransit
+    t = t.replace(new RegExp('["“”]?\\s*[-–—]?\\s*(' + reEsc(c.name) + '|@' + reEsc(c.handle) + ')\\s*$', 'i'), '').trim();
     t = t.replace(/(\s#\w+){2,}\s*$/, '').trim(); // a pile of hashtags at the end
     t = t.replace(/^(me|you|them|reply|response|answer)\s*:\s*/i, '');
     t = t.replace(/^["“”'‘’]+|["“”'‘’]+$/g, '').trim();
@@ -765,7 +775,7 @@
       const cut = t.slice(0, 240), end = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('! '), cut.lastIndexOf('? '));
       t = end > 60 ? cut.slice(0, end + 1) : cut.replace(/\s+\S*$/, '') + '…';
     }
-    if (t.length < 2 || AI_BAD.test(t) || AI_OFFWORLD.test(t) || (t.match(/#/g) || []).length > 2) return null;
+    if (t.length < 2 || AI_BAD.test(t) || AI_OFFWORLD.test(t) || garbled(t) || (t.match(/#/g) || []).length > 2) return null;
     return t;
   }
   // Hands an event to the AI. `e.ai` is 1 while it writes, 2 when its line replaced the fallback, 3 when the
@@ -1625,11 +1635,16 @@
       return head + `On (${m.label}). Characters read what you write and answer it.${l ? ' Last reply took ' + (l.ms / 1000).toFixed(1) + ' s.' : ''}</small></span>` +
         `<button class="btn" data-act="ai-remove">${ui.confirmAi ? 'Tap again to delete' : 'Turn off'}</button>`;
     }
-    const err = A.state === 'error' ? `<small class="ai-err">That didn't work: ${esc(A.detail)}. Try again on wifi.</small>` : '';
-    const best = (navigator.deviceMemory || 4) >= 8;
-    return head + 'Characters read what you write and answer it, with no internet. It downloads once, so use wifi.</small>' + err + '</span>' +
+    const err = A.state !== 'error' ? '' : A.garbled ? `<small class="ai-err">${esc(A.detail)}</small>`
+      : `<small class="ai-err">That didn't work: ${esc(A.detail)}. Try again on wifi.</small>`;
+    // Best only where the graphics chip can hold its word table (most phones can't); ask the chip once.
+    if (A.bestOk === null && A.checkGpu) A.checkGpu().catch(() => {});
+    const canBest = A.bestOk === true && A.garbled !== 'best';
+    const best = canBest && (navigator.deviceMemory || 4) >= 8;
+    const note = A.bestOk === false ? '<small>Best needs more graphics memory than this phone has, so Standard is the one for you.</small>' : '';
+    return head + 'Characters read what you write and answer it, with no internet. It downloads once, so use wifi.</small>' + note + err + '</span>' +
       `<span class="btn-row ai-pick"><button class="btn${best ? '' : ' dark'}" data-act="ai-start" data-v="standard">Standard · 670 MB</button>` +
-      `<button class="btn${best ? ' dark' : ''}" data-act="ai-start" data-v="best">Best · 1.7 GB</button></span>`;
+      (canBest ? `<button class="btn${best ? ' dark' : ''}" data-act="ai-start" data-v="best">Best · 1.7 GB</button>` : '') + '</span>';
   }
   function renderAiRow() { const el = $('#ai-row'); if (el) el.innerHTML = aiRowHTML(); }
   // Drawing pad: kids post doodles instead of photos (grown-ups can doodle too).

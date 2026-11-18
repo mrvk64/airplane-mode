@@ -12,7 +12,7 @@
 //           Anything else goes to the network (the AI model keeps its own storage).
 'use strict';
 
-const VERSION = 'bd97823367ab2';
+const VERSION = 'b9e0b70538dc1';
 const PREFIX = 'airplanemode-';
 const APP_CACHE = PREFIX + VERSION;
 const FONT_CACHE = PREFIX + 'fonts';

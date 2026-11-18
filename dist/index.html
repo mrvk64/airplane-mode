@@ -6212,17 +6212,27 @@ window.AM = window.AM || {};
 window.AM = window.AM || {};
 
 (function () {
-  const LIB = 'https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.87/lib/index.js';
+  // Pinned to 0.2.79 on purpose. From 0.2.80 the library picks each next word on the GPU, and on Qualcomm
+  // Adreno phones (most Android phones) that step returns random words in every language: measured on a
+  // Galaxy S24 Ultra on 2026-11-17, and see web-llm issue #836. 0.2.79 picks words on the CPU and writes real
+  // sentences there. Check a newer version on an Adreno phone before moving this pin.
+  const LIB = 'https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.79/lib/index.js';
   const KEY = 'airplane-mode/ai';
   const MODELS = {
     standard: { label: 'Standard', size: '670 MB', f16: 'Llama-3.2-1B-Instruct-q4f16_1-MLC', f32: 'Llama-3.2-1B-Instruct-q4f32_1-MLC' },
     best: { label: 'Best', size: '1.7 GB', f16: 'Llama-3.2-3B-Instruct-q4f16_1-MLC', f32: 'Llama-3.2-3B-Instruct-q4f32_1-MLC' }
   };
   const TIMEOUT = 45000;
+  // Each model has one big table of word meanings that the GPU has to reach in a single piece. Many phones cap
+  // that at 128 MB: Standard's table (125 MB) fits, Best's (188 MB) does not and comes out as gibberish. So Best
+  // is offered only where the cap is bigger.
+  const BEST_NEEDS = 256 * 1024 * 1024;
 
-  const AI = AM.AI = { state: 'off', progress: 0, detail: '', tier: null, model: null, stats: { n: 0, ms: 0, out: 0, last: null }, MODELS };
+  // bestOk: null until the GPU is checked, then whether this device can run Best.
+  // garbled: set when a model failed its self-check on this device, so Settings can say so plainly.
+  const AI = AM.AI = { state: 'off', progress: 0, detail: '', tier: null, model: null, bestOk: null, garbled: null, stats: { n: 0, ms: 0, out: 0, last: null }, MODELS };
   const listeners = new Set();
-  let lib = null, engine = null, loading = null, busy = false, f16 = null, restarts = 0;
+  let lib = null, engine = null, loading = null, busy = false, gpu = null, restarts = 0;
   const GPU_LOST = /disposed|instance|device|lost|gpu|operationerror|not loaded/i;
   // The browser can drop the GPU (switching apps, memory pressure). Reload the model from storage,
   // at most twice per session; after that, say so in Settings instead of retrying forever.
@@ -6237,6 +6247,25 @@ window.AM = window.AM || {};
   }
   const pending = [];
 
+  // Phones dim and lock after a few seconds, and a locked phone pauses the download, so the screen stays on
+  // while the model downloads and loads, and is let go the moment it is ready or fails.
+  let wake = null, wantWake = false;
+  async function holdScreen(on) {
+    wantWake = on;
+    try {
+      if (on && !wake && navigator.wakeLock && document.visibilityState === 'visible') {
+        const w = await navigator.wakeLock.request('screen');
+        if (!wantWake) { w.release().catch(() => {}); return; }
+        wake = w;
+        w.addEventListener('release', () => { if (wake === w) wake = null; });
+      } else if (!on && wake) {
+        const w = wake; wake = null; await w.release();
+      }
+    } catch (e) { /* not allowed (battery saver, older browser): the "keep the app open" note still shows */ }
+  }
+  // The browser drops the lock whenever the app is hidden; take it again on the way back.
+  if (typeof document !== 'undefined') document.addEventListener('visibilitychange', () => { if (wantWake && document.visibilityState === 'visible') holdScreen(true); });
+
   // The claude.ai viewer blocks the model download, so AI replies live in the installed app only.
   const loc = window.location || { hostname: '', protocol: '' };
   AI.inArtifact = !!window.claude || /claude\.ai$|claudeusercontent/.test(loc.hostname);
@@ -6248,12 +6277,33 @@ window.AM = window.AM || {};
   const save = v => { try { if (v) localStorage.setItem(KEY, JSON.stringify(v)); else localStorage.removeItem(KEY); } catch (e) { /* kept in memory */ } };
   AI.installed = () => { const s = saved(); return s && s.model ? s : null; };
 
-  async function hasF16() {
-    if (f16 !== null) return f16;
-    try { const ad = await navigator.gpu.requestAdapter(); f16 = !!(ad && ad.features && ad.features.has('shader-f16')); } catch (e) { f16 = false; }
-    return f16;
+  async function gpuInfo() {
+    if (gpu) return gpu;
+    try {
+      const ad = await navigator.gpu.requestAdapter();
+      gpu = { f16: !!(ad && ad.features && ad.features.has('shader-f16')), bind: (ad && ad.limits && ad.limits.maxStorageBufferBindingSize) || 0 };
+    } catch (e) { gpu = { f16: false, bind: 0 }; }
+    return gpu;
   }
+  // Settings calls this once to know whether to offer Best.
+  AI.checkGpu = async function () {
+    if (!AI.supported()) return false;
+    const ok = (await gpuInfo()).bind >= BEST_NEEDS;
+    if (AI.bestOk !== ok) { AI.bestOk = ok; emit(); }
+    return ok;
+  };
   async function loadLib() { if (!lib) lib = await import(LIB); return lib; }
+
+  // Some graphics chips run the model but compute it wrong, and every reply comes out as random words. One
+  // question with a known answer catches that before a garbled line can reach the feed. It also does the
+  // slow first run (shader compile), so the first real reply is quick.
+  async function selfCheck() {
+    try {
+      const r = await engine.chat.completions.create({ messages: [{ role: 'user', content: 'What is 2 plus 2? Answer with one word.' }], max_tokens: 8, temperature: 0.01 });
+      const t = (r.choices && r.choices[0] && r.choices[0].message && r.choices[0].message.content) || '';
+      return /\b(4|four)\b/i.test(t);
+    } catch (e) { return false; }
+  }
 
   // Downloads the model the first time, then loads it onto the GPU. Calling it again reuses the same work.
   // `modelOverride` is for testing with a smaller model.
@@ -6262,10 +6312,16 @@ window.AM = window.AM || {};
     loading = (async () => {
       if (!AI.supported()) { set('unsupported', ''); throw new Error('unsupported'); }
       const s = saved();
+      const g = await gpuInfo();
+      AI.bestOk = g.bind >= BEST_NEEDS;
       tier = tier || (s && s.tier) || 'standard';
-      const id = modelOverride || (s && s.tier === tier && s.model) || MODELS[tier][(await hasF16()) ? 'f16' : 'f32'];
+      // A phone that saved Best under 0.3.0 got gibberish from it; it moves to Standard (old files deleted below).
+      if (tier === 'best' && !AI.bestOk && !modelOverride) tier = 'standard';
+      const id = modelOverride || (s && s.tier === tier && s.model) || MODELS[tier][g.f16 ? 'f16' : 'f32'];
       AI.tier = tier;
+      AI.garbled = null;
       set('loading', 'Getting ready');
+      holdScreen(true);
       const L = await loadLib();
       const cached = await L.hasModelInCache(id).catch(() => false);
       set(cached ? 'loading' : 'downloading', cached ? 'Waking up the AI' : 'Starting download');
@@ -6273,14 +6329,26 @@ window.AM = window.AM || {};
       engine = await L.CreateMLCEngine(id, {
         initProgressCallback: r => { AI.progress = r.progress || 0; AI.detail = r.text || ''; emit(); }
       });
+      set('loading', 'Checking the AI');
+      if (!(await selfCheck())) {
+        // Garbled on this device: free the space and say so, rather than retrying forever.
+        try { await engine.unload(); } catch (e) { /* already gone */ }
+        engine = null;
+        await L.deleteModelAllInfoInCache(id).catch(() => {});
+        save(null);
+        AI.garbled = tier;
+        throw new Error(tier === 'best' ? 'Best gave garbled answers on this phone, so it was deleted. Try Standard.'
+          : 'This phone\'s graphics chip garbled the AI\'s answers, so it was deleted and replies stay hand-written.');
+      }
       AI.model = id;
       save({ tier, model: id });
-      set('loading', 'Warming up');
-      try { await engine.chat.completions.create({ messages: [{ role: 'user', content: 'Say hi.' }], max_tokens: 2 }); } catch (e) { /* the real replies will try again */ }
+      if (s && s.model && s.model !== id) L.deleteModelAllInfoInCache(s.model).catch(() => {});
       set('ready', '');
+      holdScreen(false);
       pump();
       return engine;
     })().catch(err => {
+      holdScreen(false);
       loading = null; engine = null;
       if (AI.state !== 'unsupported') set('error', String((err && err.message) || err).slice(0, 160));
       throw err;
@@ -6331,6 +6399,7 @@ window.AM = window.AM || {};
   AI.remove = async function () {
     const s = saved();
     pending.splice(0).forEach(j => j.reject(new Error('removed')));
+    holdScreen(false);
     try { if (engine) await engine.unload(); } catch (e) { /* nothing loaded */ }
     engine = null; loading = null;
     if (s && s.model) { try { const L = await loadLib(); await L.deleteModelAllInfoInCache(s.model); } catch (e) { /* already gone */ } }
@@ -6350,7 +6419,7 @@ window.AM = window.AM || {};
 (function () {
   'use strict';
 
-  const APP_VERSION = '0.3.0';
+  const APP_VERSION = '0.3.1';
   const MIN = 60000;
   const KEY = 'airplane-mode/v1';
 
@@ -7051,12 +7120,15 @@ window.AM = window.AM || {};
   // engine already chose (who answers, and whether they're hurt, clapping back or blocking you). The
   // pre-written line stays on the event as the fallback.
   const aiOn = () => !!(AM.AI && AM.AI.state === 'ready' && T && !W.kids);
+  // The "comedy game" line matters: without it the small model refused 3 of 8 roast and argument prompts on a
+  // phone; with it, none (2026-11-17).
   const AI_RULES = 'You write one short social media reply in character, set in a made-up city called Harbor City. ' +
+    'It is a lighthearted comedy game: teasing, roasts, rants and arguments are all playful, so stay in character. ' +
     'Keep it under 35 words. Write only the reply itself: no quotation marks around it, no name label, no hashtags unless they fit the character. ' +
     'Keep it PG-13: no slurs, no sexual content, no threats. Never mention being an AI. ' +
     'Do not mention real people, celebrities, brands, apps, movies, shows, songs or news; invent local ones if you need them. ' +
     'Talk to the passenger as "you" or by their name, and never guess their gender. ' +
-    'If anyone asks who runs the gossip account @overheard_hc, you do not know, and if they ask whether it is you, deny it.';
+    'If anyone asks who runs the gossip account @overheard_hc, you have no idea, and if they ask whether it is you, deny it playfully.';
   const MOODS = {
     topic: 'Reply naturally to what they posted.',
     echo: 'Reply to what they posted, quoting a few of their words back.',
@@ -7094,16 +7166,23 @@ window.AM = window.AM || {};
     if (x.prev) return `You said: ${quoteIt(x.prev)}. ${who} answered: ${quoteIt(x.text)}. ${mood}`;
     return `${who} posted: ${quoteIt(x.text || '(just a photo)')}${x.photo ? ` They attached a photo of ${x.photo}.` : ''} ${mood}`;
   }
-  const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\  // A line from a [tag, text] pool that this character could say: their own lines, then their voice.');
-  const AI_BAD = /\b(as an ai|language model|i can'?t (help|assist|do that)|i cannot|i'?m sorry,? but|n+[i1]+g+|f+a+g+|r+e+t+a+r+d|sex\w*|porn\w*|nude|rape|suicid\w*|kill (yourself|urself|you)|kys)\b|<\||\[\/?inst/i;
+  const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const AI_BAD = /\b(as an ai|language model|i can'?t (help|assist|do that|create|provide|participate|write|engage)|i cannot|i (won'?t|will not) (create|write|engage)|anything else i can help|i'?m sorry,? but|n+[i1]+g+|f+a+g+|r+e+t+a+r+d|sex\w*|porn\w*|nude|rape|suicid\w*|kill (yourself|urself|you)|kys)\b|<\||\[\/?inst/i;
   // Small models sometimes drift into real platforms or leak code-like junk; those lines fall back.
-  const AI_OFFWORLD = /\b(twitter|tweet\w*|instagram|tiktok|facebook|reddit|youtube|snapchat|google|amazon|netflix|chatgpt|openai|x\.com)\b|[{}<>\\|`]|\)\)|'\)|https?:/i;
+  const AI_OFFWORLD = /\b(twitter|tweet\w*|instagram|tiktok|facebook|reddit|youtube|snapchat|google|amazon|netflix|chatgpt|openai|x\.com)\b|[{}<>\\|`[\]]|\)\)|'\)|https?:/i;
+  // A GPU that computes the model wrong produces word salad from the whole vocabulary: other alphabets mixed
+  // in, and code-like names such as "_statuses". Harbor City posts in English, and underscores belong in
+  // @handles only.
+  const AI_GARBLE = /(?!\p{Script=Latin})\p{L}/u;
+  const garbled = t => AI_GARBLE.test(t) || /_/.test(t.replace(/@\w+/g, ''));
   function aiClean(raw, id) {
     const c = C[id];
     // keep the first non-empty line only: anything after a line break is the model wandering off
     let t = String(raw || '').split(/\n+/).map(x => x.trim()).filter(Boolean)[0] || '';
     t = t.replace(/\s+/g, ' ').trim();
     t = t.replace(new RegExp('^(' + reEsc(c.name) + '|@?' + reEsc(c.handle) + ')\\s*:\\s*', 'i'), '');
+    // signing off with their own name or handle, as in: ...am I right?" @hctransit
+    t = t.replace(new RegExp('["“”]?\\s*[-–—]?\\s*(' + reEsc(c.name) + '|@' + reEsc(c.handle) + ')\\s*$', 'i'), '').trim();
     t = t.replace(/(\s#\w+){2,}\s*$/, '').trim(); // a pile of hashtags at the end
     t = t.replace(/^(me|you|them|reply|response|answer)\s*:\s*/i, '');
     t = t.replace(/^["“”'‘’]+|["“”'‘’]+$/g, '').trim();
@@ -7111,7 +7190,7 @@ window.AM = window.AM || {};
       const cut = t.slice(0, 240), end = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('! '), cut.lastIndexOf('? '));
       t = end > 60 ? cut.slice(0, end + 1) : cut.replace(/\s+\S*$/, '') + '…';
     }
-    if (t.length < 2 || AI_BAD.test(t) || AI_OFFWORLD.test(t) || (t.match(/#/g) || []).length > 2) return null;
+    if (t.length < 2 || AI_BAD.test(t) || AI_OFFWORLD.test(t) || garbled(t) || (t.match(/#/g) || []).length > 2) return null;
     return t;
   }
   // Hands an event to the AI. `e.ai` is 1 while it writes, 2 when its line replaced the fallback, 3 when the
@@ -7971,11 +8050,16 @@ window.AM = window.AM || {};
       return head + `On (${m.label}). Characters read what you write and answer it.${l ? ' Last reply took ' + (l.ms / 1000).toFixed(1) + ' s.' : ''}</small></span>` +
         `<button class="btn" data-act="ai-remove">${ui.confirmAi ? 'Tap again to delete' : 'Turn off'}</button>`;
     }
-    const err = A.state === 'error' ? `<small class="ai-err">That didn't work: ${esc(A.detail)}. Try again on wifi.</small>` : '';
-    const best = (navigator.deviceMemory || 4) >= 8;
-    return head + 'Characters read what you write and answer it, with no internet. It downloads once, so use wifi.</small>' + err + '</span>' +
+    const err = A.state !== 'error' ? '' : A.garbled ? `<small class="ai-err">${esc(A.detail)}</small>`
+      : `<small class="ai-err">That didn't work: ${esc(A.detail)}. Try again on wifi.</small>`;
+    // Best only where the graphics chip can hold its word table (most phones can't); ask the chip once.
+    if (A.bestOk === null && A.checkGpu) A.checkGpu().catch(() => {});
+    const canBest = A.bestOk === true && A.garbled !== 'best';
+    const best = canBest && (navigator.deviceMemory || 4) >= 8;
+    const note = A.bestOk === false ? '<small>Best needs more graphics memory than this phone has, so Standard is the one for you.</small>' : '';
+    return head + 'Characters read what you write and answer it, with no internet. It downloads once, so use wifi.</small>' + note + err + '</span>' +
       `<span class="btn-row ai-pick"><button class="btn${best ? '' : ' dark'}" data-act="ai-start" data-v="standard">Standard · 670 MB</button>` +
-      `<button class="btn${best ? ' dark' : ''}" data-act="ai-start" data-v="best">Best · 1.7 GB</button></span>`;
+      (canBest ? `<button class="btn${best ? ' dark' : ''}" data-act="ai-start" data-v="best">Best · 1.7 GB</button>` : '') + '</span>';
   }
   function renderAiRow() { const el = $('#ai-row'); if (el) el.innerHTML = aiRowHTML(); }
   // Drawing pad: kids post doodles instead of photos (grown-ups can doodle too).
